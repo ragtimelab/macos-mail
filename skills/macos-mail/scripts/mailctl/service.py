@@ -34,9 +34,7 @@ for policy_key in (
     "search_limit_default",
     "search_limit_max",
     "send_verification_attempts",
-    "cleanup_timeout_seconds",
     "draft_verification_attempts",
-    "cleanup_attempts",
     "poll_interval_seconds",
 ):
     if not isinstance(POLICY.get(policy_key), int) or POLICY[policy_key] < 1:
@@ -139,7 +137,6 @@ def call_mail(command: str, payload: dict[str, Any] | None = None, timeout: int 
         "poll_interval_seconds": POLICY["poll_interval_seconds"],
         "draft_verification_attempts": POLICY["draft_verification_attempts"],
         "send_verification_attempts": POLICY["send_verification_attempts"],
-        "cleanup_attempts": POLICY["cleanup_attempts"],
         **(payload or {}),
     }
     with tempfile.TemporaryDirectory(prefix="macos-mail-") as temp_dir:
@@ -171,63 +168,6 @@ def call_mail(command: str, payload: dict[str, Any] | None = None, timeout: int 
     if not response.get("ok"):
         raise MailCtlError(str(response.get("code", "MAIL_ERROR")), str(response.get("error", "Mail operation failed")), response)
     return response
-
-
-def cleanup_draft_result(draft: dict[str, Any], sent: dict[str, Any]) -> dict[str, Any]:
-    try:
-        result = call_mail(
-            "cleanup_draft",
-            {
-                "draft_ref": draft["message_ref"],
-                "sent_ref": sent["message_ref"],
-                "from": draft.get("sender", ""),
-                "to": draft.get("to", []),
-                "subject": draft.get("subject", ""),
-            },
-            timeout=int(POLICY["cleanup_timeout_seconds"]),
-        )
-        return {
-            "cleanup_verified": bool(result.get("cleanup_verified")),
-            "cleanup_error": None,
-        }
-    except MailCtlError as exc:
-        return {
-            "cleanup_verified": False,
-            "cleanup_error": {"code": exc.code, "message": str(exc)},
-        }
-
-
-def cleanup_outgoing_result(draft: dict[str, Any], outgoing_ids: list[int]) -> dict[str, Any]:
-    bound_ids = sorted({int(value) for value in outgoing_ids if int(value) > 0})
-    if not bound_ids:
-        return {
-            "cleanup_verified": False,
-            "closed_count": 0,
-            "cleanup_error": {"code": "OUTGOING_ID_MISSING", "message": "No bound outgoing message id was returned"},
-        }
-    try:
-        result = call_mail(
-            "cleanup_outgoing",
-            {
-                "account": draft["message_ref"]["account"],
-                "outgoing_ids": bound_ids,
-                "from": draft.get("sender", ""),
-                "to": draft.get("to", []),
-                "subject": draft.get("subject", ""),
-            },
-            timeout=int(POLICY["cleanup_timeout_seconds"]),
-        )
-        return {
-            "cleanup_verified": bool(result.get("cleanup_verified")),
-            "closed_count": int(result.get("closed_count", 0)),
-            "cleanup_error": None,
-        }
-    except MailCtlError as exc:
-        return {
-            "cleanup_verified": False,
-            "closed_count": 0,
-            "cleanup_error": {"code": exc.code, "message": str(exc)},
-        }
 
 
 def mail_environment() -> dict[str, str]:
@@ -329,10 +269,17 @@ def send_canonical(
     attachments: list[dict[str, Any]] | None = None,
     draft_outgoing_id: int = -1,
 ) -> dict[str, Any]:
+    draft_ref = draft["message_ref"]
+    identity_key = next((key for key in ("universal_id", "rfc_message_id", "local_id") if draft_ref.get(key)), None)
+    if identity_key is None:
+        raise MailCtlError("INVALID_DRAFT", "Draft has no stable Mail identifier")
     return {
         "operation": operation,
         "account_id": draft["account_id"],
-        "draft_ref": draft["message_ref"],
+        "draft_identity": {
+            "account": draft_ref["account"], "mailbox_path": draft_ref["mailbox_path"],
+            identity_key: draft_ref[identity_key],
+        },
         "source_ref": source_ref,
         "reply_all": reply_all,
         "from": draft["sender"],
@@ -347,24 +294,23 @@ def send_canonical(
     }
 
 
-def send_snapshot_payload(
+def send_prepared_payload(
     draft: dict[str, Any],
     operation: str,
     source_ref: dict[str, Any] | None,
     reply_all: bool,
     sent_before: int,
     attachment_paths: list[str],
+    outgoing_id: int,
 ) -> dict[str, Any]:
-    """Materialize an approved Mail draft into transport-neutral values.
-
-    The AppleScript send boundary must not dereference a mutable Drafts mailbox
-    object. Mail can re-key that object while syncing, and retrying construction
-    of an outgoing message can leave duplicate server drafts. The caller reads
-    and hash-checks the draft first; this payload is then consumed once.
-    """
+    """Bind the approved draft to its original Mail outgoing object."""
     draft_ref = draft.get("message_ref")
     if not isinstance(draft_ref, dict) or not isinstance(draft_ref.get("account"), str):
         raise MailCtlError("INVALID_DRAFT", "Draft is missing its bound account reference")
+    if outgoing_id < 1:
+        raise MailCtlError("OUTGOING_NOT_BOUND", "Prepared draft has no bound Mail outgoing object")
+    if not draft.get("to"):
+        raise MailCtlError("RECIPIENT_REQUIRED", "Prepared Mail draft has no To recipient")
     return {
         "operation": operation,
         "account": draft_ref["account"],
@@ -378,6 +324,8 @@ def send_snapshot_payload(
         "reply_all": reply_all,
         "sent_before": sent_before,
         "attachments": attachment_paths,
+        "outgoing_id": outgoing_id,
+        "draft_ref": draft_ref,
     }
 
 
@@ -395,7 +343,7 @@ def save_plan(kind: str, canonical: dict[str, Any], extra: dict[str, Any]) -> tu
     now = date_now()
     plan_path = PLANS_DIR / f"{date_stamp()}-{uuid.uuid4().hex[:12]}.json"
     manifest = {
-        "schema_version": 3,
+        "schema_version": 4,
         "kind": kind,
         "status": "prepared",
         "created_at": now,
@@ -687,6 +635,8 @@ def prepare_send(args: argparse.Namespace, operation: str) -> dict[str, Any]:
     draft = result["draft"]
     sent_before = int(result["sent_before"])
     draft_outgoing_id = int(result.get("draft_outgoing_id", -1))
+    if draft_outgoing_id < 1:
+        raise MailCtlError("OUTGOING_NOT_BOUND", "Mail did not return a bound outgoing object for the prepared draft")
     canonical = send_canonical(operation, draft, source_ref, reply_all, sent_before, attachments, draft_outgoing_id)
     plan_path, _ = save_plan(
         "send",
@@ -719,7 +669,7 @@ def prepare_send(args: argparse.Namespace, operation: str) -> dict[str, Any]:
             "attachments": draft.get("attachments", []),
         },
         "verification": {
-            "draft_count_delta": 0 if result.get("operation") == "draft-new-existing" else 1,
+            "draft_count_delta": 1,
             "sent_before": sent_before,
         },
     }
@@ -792,7 +742,7 @@ def load_plan(path_text: str) -> tuple[Path, dict[str, Any]]:
     except ValueError as exc:
         raise MailCtlError("INVALID_PLAN_PATH", f"Plan must be under {PLANS_DIR}") from exc
     manifest = read_json(path)
-    if manifest.get("schema_version") != 3 or manifest.get("kind") != "send":
+    if manifest.get("schema_version") not in (3, 4) or manifest.get("kind") != "send":
         raise MailCtlError("INVALID_SEND_PLAN", "Only a current prepared send can be used")
     return path, manifest
 
@@ -818,34 +768,25 @@ def execute_send(path: Path, manifest: dict[str, Any], approved_hash: str) -> di
             "The Mail draft or its live context changed after approval.",
             {"approved_hash": approved_hash, "current_hash": current_hash, "preview": public_record(draft)},
         )
+    payload = send_prepared_payload(
+        draft, manifest["operation"], manifest.get("source_ref"),
+        bool(manifest.get("reply_all")), int(manifest["sent_before"]),
+        [item["path"] for item in attachments], int(manifest.get("draft_outgoing_id", -1)),
+    )
     manifest.update({"status": "sending", "send_attempted_at": date_now()})
     atomic_json(path, manifest)
     result = call_mail(
         "send_plan",
-        send_snapshot_payload(
-            draft,
-            manifest["operation"],
-            manifest.get("source_ref"),
-            bool(manifest.get("reply_all")),
-            int(manifest["sent_before"]),
-            [item["path"] for item in attachments],
-        ),
+        payload,
         timeout=SEND_TIMEOUT,
     )
-    window_cleanup = cleanup_outgoing_result(
-        draft,
-        [manifest.get("draft_outgoing_id", -1), result.get("send_outgoing_id", -1)],
-    )
-    cleanup = cleanup_draft_result(draft, result["sent"])
     manifest.update(
         {
             "status": "sent" if result.get("sent_verified") else "ambiguous",
             "executed_at": date_now(),
             "sent_ref": result.get("sent", {}).get("message_ref"),
-            "cleanup_verified": cleanup["cleanup_verified"],
-            "cleanup_error": cleanup["cleanup_error"],
-            "window_cleanup_verified": window_cleanup["cleanup_verified"],
-            "window_cleanup_error": window_cleanup["cleanup_error"],
+            "sent_verified_at_send": bool(result.get("sent_verified")),
+            "draft_remaining": result.get("draft_remaining"),
         }
     )
     atomic_json(path, manifest)
@@ -854,8 +795,6 @@ def execute_send(path: Path, manifest: dict[str, Any], approved_hash: str) -> di
         "operation": "execute-send",
         "plan_file": str(path),
         **result,
-        "window_cleanup": window_cleanup,
-        "draft_cleanup": cleanup,
     }
 
 
@@ -863,6 +802,8 @@ def cmd_execute(args: argparse.Namespace) -> dict[str, Any]:
     path, manifest = load_plan(args.plan_file)
     if manifest.get("kind") != "send":
         raise MailCtlError("INVALID_PLAN_KIND", "Execute accepts prepared sends only")
+    if manifest.get("schema_version") != 4:
+        raise MailCtlError("STALE_PLAN", "Older prepared drafts cannot be sent with this version; prepare a new send")
     environment = mail_environment()
     if manifest.get("environment_fingerprint") and manifest["environment_fingerprint"] != environment["fingerprint"]:
         raise MailCtlError("STALE_PLAN", "The environment fingerprint changed after preparation")
@@ -873,9 +814,13 @@ def cmd_execute(args: argparse.Namespace) -> dict[str, Any]:
 
 def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     path, manifest = load_plan(args.plan_file)
-    if manifest.get("sent_ref"):
-        result = call_mail("read_role_message", {"role": "sent", "message_ref": manifest["sent_ref"], "body_mode": "excerpt"})
-        return {"ok": True, "operation": "verify", "plan_file": str(path), "status": manifest["status"], "sent": result["message"]}
+    if manifest.get("status") == "sent" and manifest.get("sent_ref"):
+        return {
+            "ok": True, "operation": "verify", "plan_file": str(path), "status": "sent",
+            "sent_verified_at_send": manifest.get("sent_verified_at_send", True),
+            "sent_ref": manifest["sent_ref"], "current_location": "not_checked",
+            "draft_remaining_at_send": manifest.get("draft_remaining"),
+        }
     if manifest.get("kind") == "send" and manifest.get("draft_ref"):
         try:
             draft = call_mail("read_role_message", {"role": "drafts", "message_ref": manifest["draft_ref"], "body_mode": "none"})["message"]

@@ -17,13 +17,13 @@ Read metadata first (`body="none"`) for large or uncertain result sets; fetch on
 
 Use each returned exact `message_ref` for `mail_change`. Batch several refs in one `mail_change` call for `mark-read`, `trash`, or both. `trash` moves to the recoverable account Trash; never permanently delete or empty Trash. A clear user request to change specific messages is sufficient authorization. No plan hash or repeated confirmation is required. Verify `complete` and each message's state fields. If a result is uncertain, inspect the source mailbox and account Trash before trying again.
 
-Mail providers may apply a change to related conversation copies; a Gmail self-addressed test moved both the received and related Sent copies to Trash. When isolation of related messages matters, inspect them after the change and report any side effect.
+One Mail message may appear in multiple mailbox views. In a Gmail self-addressed test, the Inbox and Sent entries had the same local and RFC message IDs; Mail's native Trash action moved that message out of both views. When the same message appears in several views, explain the result using its identifiers and inspect the destination.
 
 `mail_change` also handles one-message `mark-unread`, `flag`, `unflag`, and `move`. Inspect an unfamiliar destination path before moving. `mail_attachments` lists or saves exact attachments without overwrite.
 
 ## Sending
 
-Use `mail_prepare` for a new message, reply, or forward. It returns a draft preview and `plan_id`; `mail_send(plan_id)` sends once and verifies a Sent copy. If the agent drafted the content, show the full sender, recipients, subject, body, and attachments and obtain one approval before sending. If the user supplied the exact content and recipients, their instruction is sufficient. After any ambiguous send result, use `mail_verify(plan_id)` before considering another attempt. Never blindly retry.
+Use `mail_prepare` for a new message, reply, or forward. It returns a draft preview and `plan_id`; `mail_send(plan_id)` sends the same bound Mail outgoing object once and verifies a Sent entry. If the agent drafted the content, show the full sender, recipients, subject, body, and attachments and obtain one approval before sending. If the user supplied the exact content and recipients, their instruction is sufficient. After any ambiguous send result, use `mail_verify(plan_id)` before considering another attempt. Never blindly retry. For a completed send, `mail_verify` reports the historical send result; use `mail_find` to check its current mailbox location.
 
 ## Setup and fallback
 

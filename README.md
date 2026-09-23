@@ -44,8 +44,8 @@ Skill discovery and MCP registration are separate. If you installed only the ski
 | `mail_change` | Batch mark-read/Trash, or one-message flag, unread, and move |
 | `mail_attachments` | List or save an exact attachment without overwrite |
 | `mail_prepare` | Create and verify a bound new/reply/forward draft |
-| `mail_send` | Send a prepared draft once and verify the Sent copy |
-| `mail_verify` | Inspect an ambiguous send without resending |
+| `mail_send` | Send the prepared Mail outgoing object once and verify Sent |
+| `mail_verify` | Inspect an ambiguous plan or historical send receipt without resending |
 | `mail_diagnose` | Inspect automation or outgoing state after a concrete failure |
 
 The server communicates only through local stdio. It does not listen on a network port or proxy mail to a remote service. Your AI client still receives the message content you ask it to read, according to that client's own data handling. Draft plans and compiled adapters are kept locally under `~/Library/Application Support/macos-mail`.
@@ -56,7 +56,7 @@ The server communicates only through local stdio. It does not listen on a networ
 python3 skills/macos-mail/scripts/macos_mail.py recent --unread --limit 3 --body none
 ```
 
-Use `--help` for the full CLI. The MCP and CLI share the same Mail adapter and verification logic. On an incomplete cross-account scan, check the returned `complete`, `accounts_scanned`, `accounts_total`, and failures rather than treating a partial result as exhaustive. Sending is intentionally a prepare/send sequence so the draft can be reviewed before transmission.
+Use `--help` for the full CLI. The MCP and CLI share the same Mail adapter and verification logic. On an incomplete cross-account scan, check the returned `complete`, `accounts_scanned`, `accounts_total`, and failures rather than treating a partial result as exhaustive. Sending is intentionally a prepare/send sequence so the draft can be reviewed before transmission. At send time, Mail briefly displays the prepared composer and sends that same object; this lets Mail clear its saved draft through its native send transition.
 
 ## Development
 
@@ -71,6 +71,6 @@ An installed MCP runtime can be smoke tested by connecting an MCP SDK client to 
 
 Mail.app must be available in the current logged-in macOS session. Search and scan completeness depend on Mail's local mailbox state and are reported in the tool result. Message IDs can change after moving mail, so always use the latest returned `message_ref`. On an ambiguous send or change result, inspect the current mailbox state before repeating an action.
 
-Mail providers can apply conversation-level or label side effects outside the one `message_ref` you changed. In a live Gmail self-addressed test, moving the received copy to Trash also moved the related Sent copy. A separate Gmail-to-iCloud test left the Gmail Sent copy in place after the iCloud recipient copy was trashed. Treat `mail_change` verification as verification of its named target, and inspect related messages when exact isolation matters. A Sent copy that was later moved may no longer be available to `mail_verify` in its original Sent mailbox.
+One Mail message may appear in multiple mailbox views. In a live Gmail self-addressed test, the Inbox and Sent entries had the same local and RFC message IDs; Mail's native Trash action moved that message out of both views. A separate Gmail-to-iCloud test had distinct sender and recipient messages, so moving the iCloud Inbox message left Gmail Sent intact. Compare exact identifiers when interpreting a change. `mail_verify` reports whether a send was verified at send time; use `mail_find` to inspect the message's current mailbox location.
 
 See [the skill instructions](skills/macos-mail/SKILL.md) and [Apple Mail quirks](skills/macos-mail/references/apple-mail-quirks.md).
