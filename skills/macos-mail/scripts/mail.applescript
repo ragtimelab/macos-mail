@@ -35,12 +35,8 @@ on run argv
             set responseObject to my commandDraftForward(requestObject)
         else if commandName is "send_plan" then
             set responseObject to my commandSendPlan(requestObject)
-        else if commandName is "cleanup_draft" then
-            set responseObject to my commandCleanupDraft(requestObject)
         else if commandName is "outgoing_status" then
             set responseObject to my commandOutgoingStatus(requestObject)
-        else if commandName is "cleanup_outgoing" then
-            set responseObject to my commandCleanupOutgoing(requestObject)
         else if commandName is "apply_action" then
             set responseObject to my commandApplyAction(requestObject)
         else if commandName is "act" then
@@ -1302,7 +1298,7 @@ using terms from application "Mail"
     end replaceRecipients
 
 
-    on waitForNewDraft(anAccount, senderText, subjectText, beforeIDs, attemptLimit, pollDelay)
+    on waitForNewDraft(anAccount, senderText, subjectText, toAddresses, beforeIDs, attemptLimit, pollDelay)
         set draftsRole to my roleMailbox("drafts")
         tell application "Mail"
             repeat with attempt from 1 to attemptLimit
@@ -1311,7 +1307,7 @@ using terms from application "Mail"
                 set newMatches to {}
                 repeat with aMessage in candidates
                     try
-                        if (sender of aMessage as text) is senderText and beforeIDs does not contain ((get id of aMessage) as integer) then set end of newMatches to aMessage
+                        if beforeIDs does not contain ((get id of aMessage) as integer) and my matchesEnvelope(aMessage, senderText, subjectText, toAddresses) then set end of newMatches to aMessage
                     end try
                 end repeat
                 if (count of newMatches) is 1 then return item 1 of newMatches
@@ -1355,8 +1351,7 @@ using terms from application "Mail"
         tell application "Mail"
             if email addresses of anAccount does not contain senderText then error "Sender is not configured on the selected account" number 9203
             set existingDrafts to my matchingRoleMessages("drafts", senderText, subjectText, toAddresses)
-            if (count of existingDrafts) is 1 then return my draftResponse(item 1 of existingDrafts, anAccount, "draft-new-existing", -1)
-            if (count of existingDrafts) > 1 then error "More than one matching draft already exists" number 9214
+            if (count of existingDrafts) > 0 then error "A matching draft already exists; use a unique subject" number 9214
             set draftsRole to my roleMailbox("drafts")
             set beforeIDs to my messageIDs(every message of draftsRole whose subject is subjectText)
             set outgoingMessage to make new outgoing message with properties {visible:false, sender:senderText, subject:subjectText, content:bodyText & return}
@@ -1364,7 +1359,7 @@ using terms from application "Mail"
             my addRecipients(outgoingMessage, toAddresses, ccAddresses, bccAddresses)
             my addAttachments(outgoingMessage, attachmentPaths)
             save outgoingMessage
-            set aDraft to my waitForNewDraft(anAccount, senderText, subjectText, beforeIDs, attemptLimit, pollDelay)
+            set aDraft to my waitForNewDraft(anAccount, senderText, subjectText, toAddresses, beforeIDs, attemptLimit, pollDelay)
             return my draftResponse(aDraft, anAccount, "draft-new", outgoingID)
         end tell
     end commandDraftNew
@@ -1388,10 +1383,11 @@ using terms from application "Mail"
             if (count of to recipients of outgoingMessage) is 0 and (count of cc recipients of outgoingMessage) is 0 then error "Mail generated a reply without a recipient" number 9205
             set senderText to sender of outgoingMessage as text
             set subjectText to subject of outgoingMessage as text
+            set toAddresses to my recipientAddresses(outgoingMessage, "to")
             set content of outgoingMessage to bodyText & return & return & sourceBody
             my addAttachments(outgoingMessage, attachmentPaths)
             save outgoingMessage
-            set aDraft to my waitForNewDraft(anAccount, senderText, subjectText, beforeIDs, attemptLimit, pollDelay)
+            set aDraft to my waitForNewDraft(anAccount, senderText, subjectText, toAddresses, beforeIDs, attemptLimit, pollDelay)
             set persistedBody to content of aDraft as text
             set normalizedPersistedBody to my normalizedContentText(persistedBody)
             if normalizedPersistedBody does not contain my normalizedContentText(bodyText) or normalizedPersistedBody does not contain my normalizedContentText(sourceBody) then error "Reply draft did not preserve the body and source context" number 9204
@@ -1423,40 +1419,13 @@ using terms from application "Mail"
             my replaceRecipients(outgoingMessage, toAddresses, ccAddresses, bccAddresses)
             my addAttachments(outgoingMessage, attachmentPaths)
             save outgoingMessage
-            set aDraft to my waitForNewDraft(anAccount, senderText, subjectText, beforeIDs, attemptLimit, pollDelay)
+            set aDraft to my waitForNewDraft(anAccount, senderText, subjectText, toAddresses, beforeIDs, attemptLimit, pollDelay)
             set persistedBody to content of aDraft as text
             set normalizedPersistedBody to my normalizedContentText(persistedBody)
             if normalizedPersistedBody does not contain my normalizedContentText(bodyText) or normalizedPersistedBody does not contain my normalizedContentText(sourceBody) then error "Forward draft did not preserve the body and source context" number 9205
             return my draftResponse(aDraft, anAccount, "draft-forward", outgoingID)
         end tell
     end commandDraftForward
-
-
-    on makeOutgoingFromSnapshot(operationName, senderText, subjectText, bodyText, toAddresses, ccAddresses, bccAddresses, sourceReference, replyAll, attachmentPaths)
-        tell application "Mail"
-            if operationName is "new" then
-                set outgoingMessage to make new outgoing message with properties {visible:false, sender:senderText, subject:subjectText, content:bodyText}
-                my addRecipients(outgoingMessage, toAddresses, ccAddresses, bccAddresses)
-            else
-                set {sourceAccount, sourceMailbox, sourceMessage, sourcePath} to my findMessage(sourceReference)
-                if operationName is "reply" then
-                    set outgoingMessage to reply sourceMessage opening window false reply to all replyAll
-                else if operationName is "forward" then
-                    set outgoingMessage to forward sourceMessage opening window false
-                else
-                    error "Unsupported send operation: " & operationName number 9206
-                end if
-                set sender of outgoingMessage to senderText
-                set subject of outgoingMessage to subjectText
-                set content of outgoingMessage to bodyText
-                my replaceRecipients(outgoingMessage, toAddresses, ccAddresses, bccAddresses)
-            end if
-            my addAttachments(outgoingMessage, attachmentPaths)
-            if (length of (content of outgoingMessage as text)) < 3 then error "Outgoing body is empty" number 9207
-            if (count of toAddresses) is 0 then error "Outgoing message has no To recipient" number 9208
-            return outgoingMessage
-        end tell
-    end makeOutgoingFromSnapshot
 
 
     on messageMatchesReferenceParts(aMessage, localID, expectedRFCID, expectedUniversalID)
@@ -1489,48 +1458,6 @@ using terms from application "Mail"
             return matches
         end tell
     end boundDraftCandidates
-
-
-    on cleanupBoundDrafts(draftReference, sentReference, senderText, subjectText, toAddresses, attemptLimit, pollDelay)
-        set draftParts to my refParts(draftReference)
-        set sentParts to my refParts(sentReference)
-        set {accountQuery, draftPath, draftLocalID, draftRFCID, draftUniversalID} to draftParts
-        set {sentAccountQuery, sentPath, sentLocalID, sentRFCID, sentUniversalID} to sentParts
-        if sentAccountQuery is not accountQuery then error "Draft and Sent references belong to different accounts" number 9217
-        set anAccount to my resolveAccount(accountQuery)
-        set aDraftsMailbox to my resolveMailbox(anAccount, draftPath)
-
-        repeat with cleanupAttempt from 1 to attemptLimit
-            set matches to my boundDraftCandidates(aDraftsMailbox, senderText, subjectText, toAddresses, draftParts, sentParts)
-            if (count of matches) is 0 then return true
-            tell application "Mail"
-                repeat with cleanupDraft in matches
-                    try
-                        delete cleanupDraft
-                    end try
-                end repeat
-            end tell
-            delay pollDelay
-        end repeat
-        return (count of my boundDraftCandidates(aDraftsMailbox, senderText, subjectText, toAddresses, draftParts, sentParts)) is 0
-    end cleanupBoundDrafts
-
-
-    on commandCleanupDraft(requestObject)
-        set draftReference to my requestValue(requestObject, "draft_ref")
-        set sentReference to my requestValue(requestObject, "sent_ref")
-        set senderText to my requestText(requestObject, "from", "")
-        set toAddresses to my requestTextList(requestObject, "to")
-        set subjectText to my requestText(requestObject, "subject", "")
-        set attemptLimit to my requestInteger(requestObject, "cleanup_attempts", 1)
-        set pollDelay to my requestInteger(requestObject, "poll_interval_seconds", 1)
-        set cleanupVerified to my cleanupBoundDrafts(draftReference, sentReference, senderText, subjectText, toAddresses, attemptLimit, pollDelay)
-        set resultObject to my newDictionary()
-        my putValue(resultObject, "ok", cleanupVerified)
-        my putValue(resultObject, "operation", "cleanup-draft")
-        my putValue(resultObject, "cleanup_verified", cleanupVerified)
-        return resultObject
-    end commandCleanupDraft
 
 
     on senderBelongsToAccount(senderText, anAccount)
@@ -1599,50 +1526,6 @@ using terms from application "Mail"
     end commandOutgoingStatus
 
 
-    on commandCleanupOutgoing(requestObject)
-        set accountQuery to my requestText(requestObject, "account", "")
-        set outgoingIDs to my requestIntegerList(requestObject, "outgoing_ids")
-        set senderText to my requestText(requestObject, "from", "")
-        set toAddresses to my requestTextList(requestObject, "to")
-        set subjectText to my requestText(requestObject, "subject", "")
-        set attemptLimit to my requestInteger(requestObject, "cleanup_attempts", 1)
-        set pollDelay to my requestInteger(requestObject, "poll_interval_seconds", 1)
-        if (count of outgoingIDs) < 1 then error "At least one bound outgoing message id is required" number 9219
-        set anAccount to my resolveAccount(accountQuery)
-        if not my senderBelongsToAccount(senderText, anAccount) then error "Sender is not configured on the selected account" number 9203
-
-        set matches to my matchingOutgoingByIDs(outgoingIDs, senderText, subjectText, toAddresses)
-        set visibleMatches to {}
-        tell application "Mail"
-            repeat with outgoingMessage in matches
-                if visible of outgoingMessage then set end of visibleMatches to outgoingMessage
-            end repeat
-            repeat with outgoingMessage in visibleMatches
-                close outgoingMessage saving no
-            end repeat
-        end tell
-        repeat with cleanupAttempt from 1 to attemptLimit
-            set remainingMatches to my matchingOutgoingByIDs(outgoingIDs, senderText, subjectText, toAddresses)
-            set remainingVisibleCount to 0
-            tell application "Mail"
-                repeat with outgoingMessage in remainingMatches
-                    if visible of outgoingMessage then set remainingVisibleCount to remainingVisibleCount + 1
-                end repeat
-            end tell
-            if remainingVisibleCount is 0 then
-                set resultObject to my newDictionary()
-                my putValue(resultObject, "ok", true)
-                my putValue(resultObject, "operation", "cleanup-outgoing")
-                my putValue(resultObject, "cleanup_verified", true)
-                my putValue(resultObject, "closed_count", count of visibleMatches)
-                return resultObject
-            end if
-            delay pollDelay
-        end repeat
-        error "Bound outgoing message windows remained visible" number 9220
-    end commandCleanupOutgoing
-
-
     on commandSendPlan(requestObject)
         set operationName to my requestText(requestObject, "operation", "")
         set accountQuery to my requestText(requestObject, "account", "")
@@ -1654,6 +1537,8 @@ using terms from application "Mail"
         set bodyText to my requestText(requestObject, "body", "")
         set sourceReference to my requestValue(requestObject, "source_ref")
         set replyAll to my requestBoolean(requestObject, "reply_all", false)
+        set draftReference to my requestValue(requestObject, "draft_ref")
+        set expectedOutgoingID to my requestInteger(requestObject, "outgoing_id", -1)
         set expectedSentBefore to my requestInteger(requestObject, "sent_before", -1)
         set attachmentPaths to my requestTextList(requestObject, "attachments")
         set attemptLimit to my requestInteger(requestObject, "send_verification_attempts", 1)
@@ -1672,13 +1557,20 @@ using terms from application "Mail"
         if (count of beforeMatches) is not expectedSentBefore then error "Sent baseline changed after preparation" number 9209
         set beforeIDs to my messageIDs(beforeMatches)
 
-        -- This is the non-retryable side-effect boundary. The approved draft has
-        -- already been materialized and hash-checked by Python. Construct exactly
-        -- one outgoing object, then invoke Mail's send command exactly once.
-        set outgoingMessage to my makeOutgoingFromSnapshot(operationName, senderText, subjectText, bodyText, toAddresses, ccAddresses, bccAddresses, sourceReference, replyAll, attachmentPaths)
-        tell application "Mail" to set outgoingID to (get id of outgoingMessage) as integer
-
+        if expectedOutgoingID < 1 then error "Prepared outgoing message id is missing" number 9221
+        set outgoingMatches to my matchingOutgoingByIDs({expectedOutgoingID}, senderText, subjectText, toAddresses)
+        if (count of outgoingMatches) is not 1 then error "Prepared outgoing message is unavailable" number 9221
+        set outgoingMessage to item 1 of outgoingMatches
         tell application "Mail"
+            if not my sameAddressList(my recipientAddresses(outgoingMessage, "cc"), ccAddresses) then error "Prepared outgoing Cc changed" number 9222
+            if not my sameAddressList(my recipientAddresses(outgoingMessage, "bcc"), bccAddresses) then error "Prepared outgoing Bcc changed" number 9222
+            if my normalizedContentText(content of outgoingMessage as text) is not my normalizedContentText(bodyText) then error "Prepared outgoing body changed" number 9222
+        end tell
+
+        -- Mail's visible composer send transition clears the saved server draft.
+        -- Sending this object while hidden left the draft in Gmail Drafts.
+        tell application "Mail"
+            set visible of outgoingMessage to true
             set sendAccepted to send outgoingMessage
             if not sendAccepted then error "Mail did not accept the outgoing message" number 9210
             set sentMessage to missing value
@@ -1722,6 +1614,14 @@ using terms from application "Mail"
             end if
             set sentPath to {name of mailbox of sentMessage as text}
             set sentDictionary to my messageDictionary(sentMessage, anAccount, sentPath, "full", false, false)
+            set draftRemaining to missing value
+            try
+                set draftParts to my refParts(draftReference)
+                set sentParts to my refParts(my requestValue(sentDictionary, "message_ref"))
+                set {draftAccount, draftPath, draftLocalID, draftRFCID, draftUniversalID} to draftParts
+                set aDraftsMailbox to my resolveMailbox(anAccount, draftPath)
+                set draftRemaining to ((count of my boundDraftCandidates(aDraftsMailbox, senderText, subjectText, toAddresses, draftParts, sentParts)) > 0)
+            end try
             set resultObject to my newDictionary()
             my putValue(resultObject, "ok", true)
             my putValue(resultObject, "operation", "send-plan")
@@ -1730,7 +1630,8 @@ using terms from application "Mail"
             my putValue(resultObject, "sent_delta", 1)
             my putValue(resultObject, "reply_header_verified", replyHeaderVerified)
             my putValue(resultObject, "sent", sentDictionary)
-            my putValue(resultObject, "send_outgoing_id", outgoingID)
+            my putValue(resultObject, "send_outgoing_id", expectedOutgoingID)
+            my putValue(resultObject, "draft_remaining", draftRemaining)
             return resultObject
         end tell
     end commandSendPlan

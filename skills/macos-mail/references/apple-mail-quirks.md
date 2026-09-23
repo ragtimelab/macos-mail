@@ -18,7 +18,7 @@ Do not copy observed OS, Mail, or SDEF values into this reference. Inspect the l
 - `send` accepts an `outgoing message`, not a stored generic `message`.
 - `reply` and `forward` create and return an `outgoing message`.
 - `outgoing message` exposes sender, subject, content, visibility, recipients, save, and send.
-- A stored draft is later observed as a generic message. Recreate an outgoing object from the approved draft before sending.
+- A stored draft is later observed as a generic message. Keep the `outgoing message` ID created during preparation and send that same object after checking the saved draft.
 - Received `message` exposes content, headers, source, read/flag status, Message-ID, and received attachments.
 - Received `mail attachment` supports metadata and save.
 - The Text Suite separately exposes writable `attachment.file name` inside rich text. Use that surface for outgoing files, then verify the stored draft and Sent/received copies; do not confuse it with received `mail attachment`.
@@ -35,16 +35,15 @@ Do not copy observed OS, Mail, or SDEF values into this reference. Inspect the l
 - Treat received-attachment metadata properties as independently fallible. Mail can enumerate an attachment and expose its name while one optional property raises; do not discard the entire attachment array because one metadata read failed.
 - IMAP draft synchronization can replace a draft's local Mail ID between AppleScript processes. Resolve the bound local ID first; only when it disappears, fall back to exactly one RFC Message-ID match inside the already-bound account mailbox. Never accept an RFC mismatch or multiple matches.
 - Gmail draft synchronization can replace both the local Mail ID and RFC Message-ID. Bind Mail's `X-Universally-Unique-Identifier` from the official `all headers` property, restrict draft fallback to the selected account's exact Drafts mailbox, and accept only one matching universal identifier.
-- Do not retain a Mail draft object reference across send verification delays. After Sent is verified, re-resolve the approved 3-part draft reference, delete that current draft object, and verify that no bound draft remains.
-- Serialize a verified Sent message to plain result data before draft-cleanup polling. Do not dereference a Sent Mail object after an IMAP synchronization delay.
+- Do not retain a Mail draft object reference across send verification delays. Save its exact reference during preparation, and use it only for read-only checks after sending.
+- Serialize a verified Sent message to plain result data before further mailbox polling. Do not dereference a Sent Mail object after an IMAP synchronization delay.
 - After moving or restoring a message, replace its mailbox path in the bound reference and re-resolve it in the destination. Do not read the object returned by `move` after a synchronization delay.
 - Verify Trash source removal by the complete bound reference, not disappearance of the old local ID alone; IMAP rekeying is not deletion evidence.
-- Retry only pre-send draft resolution and value snapshotting when Mail invalidates an object with `-1728`. Call `send` once only after the snapshot is complete; a failure after that boundary must never trigger another send.
+- Retry only pre-send draft resolution and value snapshotting when Mail invalidates an object with `-1728`. Call `send` once on the prepared outgoing object after its values are checked; a failure after that boundary must never trigger another send.
 - Hidden `reply` and `forward` objects may expose no generated quote. Capture the source message's official `content` before composition, append it explicitly after the user body, save, then verify both parts in the stored draft.
-- Mail may re-key a saved draft while synchronizing it. Resolve and hash-check the approved draft in Python, materialize its envelope/body as JSON values, and pass those values across the send boundary.
-- Outgoing-message construction is non-retryable because even `close ... saving no` can leave a Gmail server draft. Construct exactly one outgoing object and invoke the sole `send` call once; inspect an error at either boundary before any new send attempt.
-- After a verified send, Gmail may temporarily retain both the approved source draft and an outgoing-derived server draft with different local/RFC identifiers. Cleanup must bind the original draft reference and verified Sent reference, restrict matches by the exact account and envelope, remove only those bound Drafts entries, and verify their absence within `cleanup_timeout_seconds`.
-- Mail can retain hidden `outgoing message` backend objects after successful send and after a supported `close`; the live SDEF exposes `close` but no backend-deletion command. Capture each official integer `id`; after Sent verification, revalidate its account sender and exact envelope, close only bound objects whose official `visible` property is true, and verify every bound object is absent or `visible:false`. Do not claim hidden backend deletion. Run server-draft cleanup afterward because closing can trigger synchronization side effects.
+- Mail may re-key a saved draft while synchronizing it. Resolve and hash-check the approved draft in Python, then use its original outgoing object ID for the single native `send` call. Revalidate the outgoing envelope and body immediately before sending.
+- Constructing a second outgoing object at send time leaves an extra Gmail server draft; deleting that draft moves it to Trash. Sending the saved object while hidden also left its draft in Gmail Drafts in a controlled test. Prepare one outgoing object, save it for review, make its composer visible immediately before sending, and send that same object. Mail then cleared Drafts without a Trash artifact in a controlled test. Do not clean up a successful send by deleting drafts.
+- Mail can retain a hidden `outgoing message` backend object after a successful send. The live SDEF exposes `close` but no backend-deletion command, and closing it did not remove that backend in a controlled test. Do not claim hidden backend deletion; verify user-visible Drafts, Sent, and Trash by exact subject and message identifiers.
 
 ## Permissions
 

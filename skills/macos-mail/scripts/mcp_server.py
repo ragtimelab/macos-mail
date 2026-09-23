@@ -45,7 +45,7 @@ server = MCPServer(
         "Use returned message_ref values for changes. Check complete and per-message verification. "
         "Do not retry an uncertain send, permanently delete mail, or empty Trash."
     ),
-    version="0.1.0",
+    version="0.1.1",
 )
 
 
@@ -223,7 +223,7 @@ async def mail_prepare(
 
 @server.tool(annotations=ToolAnnotations(destructiveHint=True, openWorldHint=False), structured_output=True)
 async def mail_send(plan_id: str) -> dict[str, Any]:
-    """Send one prepared draft once; verify the Sent copy and never auto-retry."""
+    """Send the prepared Mail outgoing object once; verify Sent and never auto-retry."""
     try:
         path = _plan_path(plan_id)
     except service.MailCtlError as exc:
@@ -235,7 +235,7 @@ async def mail_send(plan_id: str) -> dict[str, Any]:
 
 @server.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False), structured_output=True)
 async def mail_verify(plan_id: str) -> dict[str, Any]:
-    """Inspect the exact prepared or ambiguous send without resending."""
+    """Inspect a send receipt or unresolved plan without resending; location is separate."""
     try:
         path = _plan_path(plan_id)
     except service.MailCtlError as exc:

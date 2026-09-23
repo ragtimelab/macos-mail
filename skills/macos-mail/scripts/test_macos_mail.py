@@ -116,13 +116,13 @@ class MailCliTests(unittest.TestCase):
         self.assertFalse(result["complete"])
 
     def test_prepared_send_stays_bound_without_user_supplied_hash(self) -> None:
-        manifest = {"kind": "send", "status": "prepared", "plan_hash": "internal", "environment_fingerprint": "same"}
+        manifest = {"schema_version": 4, "kind": "send", "status": "prepared", "plan_hash": "internal", "environment_fingerprint": "same"}
         with patch.object(mail, "load_plan", return_value=(Path("/tmp/plan"), manifest)), patch.object(mail, "mail_environment", return_value={"fingerprint": "same"}), patch.object(mail, "execute_send", return_value={"ok": True}) as execute:
             mail.cmd_execute(argparse.Namespace(plan_file="/tmp/plan"))
         self.assertEqual(execute.call_args.args[2], "internal")
 
     def test_changed_send_environment_stops_before_send(self) -> None:
-        manifest = {"kind": "send", "status": "prepared", "plan_hash": "internal", "environment_fingerprint": "old"}
+        manifest = {"schema_version": 4, "kind": "send", "status": "prepared", "plan_hash": "internal", "environment_fingerprint": "old"}
         with patch.object(mail, "load_plan", return_value=(Path("/tmp/plan"), manifest)), patch.object(mail, "mail_environment", return_value={"fingerprint": "new"}), patch.object(mail, "execute_send") as execute:
             with self.assertRaises(mail.MailCtlError) as stale:
                 mail.cmd_execute(argparse.Namespace(plan_file="/tmp/plan"))
@@ -134,12 +134,12 @@ class MailCliTests(unittest.TestCase):
             "message_ref": ref(), "account_id": "account-id", "sender": "a@example.test",
             "to": ["b@example.test"], "cc": [], "bcc": [], "subject": "Subject", "body": "Body",
         }
-        canonical = mail.send_canonical("new", draft, None, False, 0, [], -1)
+        canonical = mail.send_canonical("new", draft, None, False, 0, [], 19)
         digest = mail.bound_plan_hash(canonical, "same")
         manifest = {
             "kind": "send", "status": "prepared", "plan_hash": digest,
             "operation": "new", "draft_ref": ref(), "source_ref": None,
-            "reply_all": False, "sent_before": 0, "draft_outgoing_id": -1,
+            "reply_all": False, "sent_before": 0, "draft_outgoing_id": 19,
             "attachments": [], "environment_fingerprint": "same",
         }
         with tempfile.TemporaryDirectory() as directory:
@@ -153,6 +153,60 @@ class MailCliTests(unittest.TestCase):
                 with self.assertRaises(mail.MailCtlError):
                     mail.execute_send(path, manifest, digest)
             self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["status"], "sending")
+
+    def test_prepared_send_uses_bound_outgoing_without_cleanup(self) -> None:
+        draft = {
+            "message_ref": ref(), "account_id": "account-id", "sender": "a@example.test",
+            "to": ["b@example.test"], "cc": [], "bcc": [], "subject": "Subject", "body": "Body",
+        }
+        canonical = mail.send_canonical("new", draft, None, False, 0, [], 19)
+        digest = mail.bound_plan_hash(canonical, "same")
+        manifest = {
+            "schema_version": 4, "kind": "send", "status": "prepared", "plan_hash": digest,
+            "operation": "new", "draft_ref": ref(), "source_ref": None,
+            "reply_all": False, "sent_before": 0, "draft_outgoing_id": 19,
+            "attachments": [], "environment_fingerprint": "same",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plan.json"
+            def fake_call(command, payload, **_kwargs):
+                if command == "read_role_message":
+                    return {"message": draft}
+                self.assertEqual(command, "send_plan")
+                self.assertEqual(payload["outgoing_id"], 19)
+                self.assertEqual(payload["draft_ref"], ref())
+                return {"sent_verified": True, "sent": {"message_ref": ref(20)}, "draft_remaining": False}
+            with patch.object(mail, "call_mail", side_effect=fake_call) as called:
+                result = mail.execute_send(path, manifest, digest)
+            self.assertTrue(result["sent_verified"])
+            self.assertEqual([call.args[0] for call in called.call_args_list], ["read_role_message", "send_plan"])
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["status"], "sent")
+
+    def test_old_prepared_plan_rejected_but_old_sent_receipt_verifies(self) -> None:
+        old = {"schema_version": 3, "kind": "send", "status": "prepared", "plan_hash": "old"}
+        with patch.object(mail, "load_plan", return_value=(Path("/tmp/old"), old)), patch.object(mail, "call_mail") as called:
+            with self.assertRaises(mail.MailCtlError) as stale:
+                mail.cmd_execute(argparse.Namespace(plan_file="/tmp/old"))
+            self.assertEqual(stale.exception.code, "STALE_PLAN")
+            old.update(status="sent", sent_ref=ref())
+            verified = mail.cmd_verify(argparse.Namespace(plan_file="/tmp/old"))
+            self.assertTrue(verified["sent_verified_at_send"])
+            self.assertEqual(verified["current_location"], "not_checked")
+            called.assert_not_called()
+
+    def test_draft_rekey_keeps_plan_identity_but_missing_recipient_stops_send(self) -> None:
+        draft = {
+            "message_ref": {**ref(), "universal_id": "stable-uuid"},
+            "account_id": "account-id", "sender": "a@example.test",
+            "to": ["b@example.test"], "cc": [], "bcc": [], "subject": "Subject", "body": "Body",
+        }
+        first = mail.send_canonical("new", draft, None, False, 0, [], 19)
+        draft["message_ref"] = {**draft["message_ref"], "local_id": 29, "rfc_message_id": "<new@example.test>"}
+        self.assertEqual(first, mail.send_canonical("new", draft, None, False, 0, [], 19))
+        draft["to"] = []
+        with self.assertRaises(mail.MailCtlError) as missing:
+            mail.send_prepared_payload(draft, "new", None, False, 0, [], 19)
+        self.assertEqual(missing.exception.code, "RECIPIENT_REQUIRED")
 
 
 if __name__ == "__main__":

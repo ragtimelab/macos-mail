@@ -2,11 +2,9 @@
   "schema_version": 1,
   "command_timeout_seconds": 30,
   "send_timeout_seconds": 60,
-  "cleanup_timeout_seconds": 60,
   "search_limit_default": 50,
   "search_limit_max": 200,
   "send_verification_attempts": 30,
   "draft_verification_attempts": 20,
-  "cleanup_attempts": 45,
   "poll_interval_seconds": 1
 }
