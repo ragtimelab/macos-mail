@@ -5,30 +5,32 @@ on:
 jobs:
   test:
     runs-on: macos-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ['3.10', '3.13', '3.14']
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
-          python-version: ${{ matrix.python-version }}
+          version: '0.12.18'
       - name: Install locked MCP runtime
         run: |
-          python3 -m pip install 'uv==0.12.18'
-          uv venv .venv --python "$(command -v python3)"
-          uv pip sync --python .venv/bin/python --require-hashes --strict skills/macos-mail-mcp/requirements-mcp.lock
+          uv venv .venv --python 3.14
+          uv run --no-project --python 3.14 - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, 'skills/macos-mail-mcp/scripts')
+          import install_mcp
+          install_mcp.VENV = Path('.venv').resolve()
+          install_mcp.sync_runtime('uv')
+          PY
           .venv/bin/python -c 'from mcp.server.mcpserver import MCPServer'
       - name: Python unit tests
         run: .venv/bin/python -m unittest discover -s skills/macos-mail-mcp/scripts -p 'test_*.py' -v
       - name: Public privacy check
         env:
           PRIVACY_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: python3 scripts/check_public_privacy.py --base "$PRIVACY_BASE_SHA"
+        run: uv run --no-project --python 3.14 scripts/check_public_privacy.py --base "$PRIVACY_BASE_SHA"
       - name: Compile AppleScript
         run: osacompile -o /tmp/macos-mail-mcp-ci.scpt skills/macos-mail-mcp/scripts/mail.applescript
       - name: Check Python syntax
-        run: python3 -m compileall -q skills/macos-mail-mcp/scripts
+        run: .venv/bin/python -m compileall -q skills/macos-mail-mcp/scripts

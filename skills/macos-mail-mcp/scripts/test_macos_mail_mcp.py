@@ -28,14 +28,13 @@ def ref(local_id: int = 17) -> dict:
 
 
 class MailCliTests(unittest.TestCase):
-    def test_fast_paths_and_send_without_user_hash_are_exposed(self) -> None:
+    def test_cli_exposes_read_and_change_but_no_multistep_send(self) -> None:
         parser = mail.build_parser()
         self.assertIs(parser.parse_args(["recent", "--unread", "--limit", "3", "--body", "full"]).func, mail.cmd_recent)
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             parser.parse_args(["recent", "--scope", "all-inboxes"])
         self.assertIs(parser.parse_args(["act", "--refs-file", "/tmp/refs.json", "--actions", "mark-read,trash"]).func, mail.cmd_act)
-        self.assertIs(parser.parse_args(["execute", "--plan-file", "/tmp/send.json"]).func, mail.cmd_execute)
-        for command in ("compat", "compat-test", "prepare-action"):
+        for command in ("execute", "verify", "prepare-new", "prepare-reply", "prepare-forward", "compat", "compat-test"):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 parser.parse_args([command])
 
@@ -119,19 +118,13 @@ class MailCliTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertFalse(result["complete"])
 
-    def test_prepared_send_stays_bound_without_user_supplied_hash(self) -> None:
-        manifest = {"schema_version": 4, "kind": "send", "status": "prepared", "plan_hash": "internal", "environment_fingerprint": "same"}
-        with patch.object(mail, "load_plan", return_value=(Path("/tmp/plan"), manifest)), patch.object(mail, "mail_environment", return_value={"fingerprint": "same"}), patch.object(mail, "execute_send", return_value={"ok": True}) as execute:
-            mail.cmd_execute(argparse.Namespace(plan_file="/tmp/plan"))
-        self.assertEqual(execute.call_args.args[2], "internal")
-
     def test_changed_send_environment_stops_before_send(self) -> None:
-        manifest = {"schema_version": 4, "kind": "send", "status": "prepared", "plan_hash": "internal", "environment_fingerprint": "old"}
-        with patch.object(mail, "load_plan", return_value=(Path("/tmp/plan"), manifest)), patch.object(mail, "mail_environment", return_value={"fingerprint": "new"}), patch.object(mail, "execute_send") as execute:
+        manifest = {"environment_fingerprint": "old"}
+        with patch.object(mail, "mail_environment", return_value={"fingerprint": "new"}), patch.object(mail, "call_mail") as called:
             with self.assertRaises(mail.MailCtlError) as stale:
-                mail.cmd_execute(argparse.Namespace(plan_file="/tmp/plan"))
-        self.assertEqual(stale.exception.code, "STALE_PLAN")
-        execute.assert_not_called()
+                mail.execute_send(manifest)
+            self.assertEqual(stale.exception.code, "STALE_PLAN")
+        called.assert_not_called()
 
     def test_ambiguous_send_cannot_be_replayed(self) -> None:
         draft = {
@@ -141,22 +134,21 @@ class MailCliTests(unittest.TestCase):
         canonical = mail.send_canonical("new", draft, None, False, 0, [], 19)
         digest = mail.bound_plan_hash(canonical, "same")
         manifest = {
-            "kind": "send", "status": "prepared", "plan_hash": digest,
+            "plan_hash": digest,
             "operation": "new", "draft_ref": ref(), "source_ref": None,
             "reply_all": False, "sent_before": 0, "draft_outgoing_id": 19,
             "attachments": [], "environment_fingerprint": "same",
         }
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "plan.json"
-            path.write_text(json.dumps(manifest), encoding="utf-8")
-            def fake_call(command, *_args, **_kwargs):
-                if command == "read_role_message":
-                    return {"message": draft}
-                raise mail.MailCtlError("TIMEOUT", "Send result unknown")
-            with patch.object(mail, "call_mail", side_effect=fake_call):
-                with self.assertRaises(mail.MailCtlError):
-                    mail.execute_send(path, manifest, digest)
-            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["status"], "sending")
+        def fake_call(command, *_args, **_kwargs):
+            if command == "read_role_message":
+                return {"message": draft}
+            raise mail.MailCtlError("TIMEOUT", "Send result unknown")
+        with tempfile.TemporaryDirectory() as directory, patch.object(mail, "STATE_ROOT", Path(directory)), \
+             patch.object(mail, "mail_environment", return_value={"fingerprint": "same"}), \
+             patch.object(mail, "attachment_inputs", return_value=[]), patch.object(mail, "call_mail", side_effect=fake_call):
+            with self.assertRaises(mail.MailCtlError):
+                mail.execute_send(manifest)
+            self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_prepared_send_uses_bound_outgoing_without_cleanup(self) -> None:
         draft = {
@@ -166,37 +158,39 @@ class MailCliTests(unittest.TestCase):
         canonical = mail.send_canonical("new", draft, None, False, 0, [], 19)
         digest = mail.bound_plan_hash(canonical, "same")
         manifest = {
-            "schema_version": 4, "kind": "send", "status": "prepared", "plan_hash": digest,
+            "plan_hash": digest,
             "operation": "new", "draft_ref": ref(), "source_ref": None,
             "reply_all": False, "sent_before": 0, "draft_outgoing_id": 19,
             "attachments": [], "environment_fingerprint": "same",
         }
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "plan.json"
-            def fake_call(command, payload, **_kwargs):
-                if command == "read_role_message":
-                    return {"message": draft}
-                self.assertEqual(command, "send_plan")
-                self.assertEqual(payload["outgoing_id"], 19)
-                self.assertEqual(payload["draft_ref"], ref())
-                return {"sent_verified": True, "sent": {"message_ref": ref(20)}, "draft_remaining": False}
-            with patch.object(mail, "call_mail", side_effect=fake_call) as called:
-                result = mail.execute_send(path, manifest, digest)
+        def fake_call(command, payload, **_kwargs):
+            if command == "read_role_message":
+                return {"message": draft}
+            self.assertEqual(command, "send_plan")
+            self.assertEqual(payload["outgoing_id"], 19)
+            self.assertEqual(payload["draft_ref"], ref())
+            return {"sent_verified": True, "sent": {"message_ref": ref(20)}, "draft_remaining": False}
+        with tempfile.TemporaryDirectory() as directory, patch.object(mail, "STATE_ROOT", Path(directory)), \
+             patch.object(mail, "mail_environment", return_value={"fingerprint": "same"}), \
+             patch.object(mail, "attachment_inputs", return_value=[]), patch.object(mail, "call_mail", side_effect=fake_call) as called:
+            result = mail.execute_send(manifest)
             self.assertTrue(result["sent_verified"])
             self.assertEqual([call.args[0] for call in called.call_args_list], ["read_role_message", "send_plan"])
-            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["status"], "sent")
+            self.assertEqual(list(Path(directory).iterdir()), [])
 
-    def test_old_prepared_plan_rejected_but_old_sent_receipt_verifies(self) -> None:
-        old = {"schema_version": 3, "kind": "send", "status": "prepared", "plan_hash": "old"}
-        with patch.object(mail, "load_plan", return_value=(Path("/tmp/old"), old)), patch.object(mail, "call_mail") as called:
-            with self.assertRaises(mail.MailCtlError) as stale:
-                mail.cmd_execute(argparse.Namespace(plan_file="/tmp/old"))
-            self.assertEqual(stale.exception.code, "STALE_PLAN")
-            old.update(status="sent", sent_ref=ref())
-            verified = mail.cmd_verify(argparse.Namespace(plan_file="/tmp/old"))
-            self.assertTrue(verified["sent_verified_at_send"])
-            self.assertEqual(verified["current_location"], "not_checked")
-            called.assert_not_called()
+    def test_verify_requires_unique_matching_sent_evidence(self) -> None:
+        plan = {"draft_ref": ref(), "sender": "a@example.test", "to": ["b@example.test"],
+                "subject": "Subject", "sent_before": 0, "created_at": "2026-09-24T04:23:26+0900",
+                "body_sha256": mail.sha256_text("Body")}
+        sent = {"count": 1, "candidates": [{"local_id": 20, "body": "Body"}]}
+        def fake_call(command, *_args, **_kwargs):
+            if command == "read_role_message":
+                raise mail.MailCtlError("NOT_FOUND", "No draft")
+            return sent
+        with patch.object(mail, "call_mail", side_effect=fake_call):
+            self.assertEqual(mail.verify_send_evidence(plan)["status"], "confirmed_sent")
+            sent["candidates"].append({"local_id": 21, "body": "Body"})
+            self.assertEqual(mail.verify_send_evidence(plan)["status"], "unknown")
 
     def test_draft_rekey_keeps_plan_identity_but_missing_recipient_stops_send(self) -> None:
         draft = {
@@ -258,19 +252,18 @@ class MailCliTests(unittest.TestCase):
                     mail.cmd_attachment_save(args)
             self.assertEqual(unsafe.exception.code, "UNSAFE_ATTACHMENT_NAME")
 
-    def test_send_plan_lock_rejects_a_concurrent_execution(self) -> None:
+    def test_one_send_lock_rejects_a_concurrent_execution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "plan.json"
-
             def contend():
                 with self.assertRaises(mail.MailCtlError) as busy:
-                    with mail.locked_send_plan(path):
+                    with mail.locked_send():
                         pass
                 return busy.exception.code
 
-            with mail.locked_send_plan(path), ThreadPoolExecutor(max_workers=1) as pool:
-                self.assertEqual(pool.submit(contend).result(), "PLAN_BUSY")
-            self.assertEqual(stat.S_IMODE((Path(directory) / "plan.json.lock").stat().st_mode), 0o600)
+            with patch.object(mail, "STATE_ROOT", Path(directory)), patch.object(mail, "SEND_LOCK", Path(directory) / "send.lock"):
+                with mail.locked_send(), ThreadPoolExecutor(max_workers=1) as pool:
+                    self.assertEqual(pool.submit(contend).result(), "PLAN_BUSY")
+                self.assertEqual(stat.S_IMODE((Path(directory) / "send.lock").stat().st_mode), 0o600)
 
     def test_mail_output_and_prepare_inputs_are_bounded(self) -> None:
         with patch.object(mail, "MAX_MAIL_RESPONSE_BYTES", 16):

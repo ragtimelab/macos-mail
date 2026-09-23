@@ -26,8 +26,8 @@ SKILL_ROOT = Path(__file__).resolve().parents[2]
 APPLESCRIPT = SKILL_ROOT / "scripts" / "mail.applescript"
 MAIL_APP: Path | None = None
 MAIL_SDEF: Path | None = None
-STATE_ROOT = Path(os.environ.get("MACOS_MAIL_MCP_STATE_DIR", Path.home() / "Library" / "Application Support" / "macos-mail-mcp")).expanduser().resolve()
-PLANS_DIR = STATE_ROOT / "plans"
+STATE_ROOT = Path(os.environ.get("MACOS_MAIL_MCP_STATE_DIR", Path.home() / "Library" / "Application Support" / "macos-mail-mcp")).expanduser().absolute()
+SEND_LOCK = STATE_ROOT / "send.lock"
 POLICY = json.loads((SKILL_ROOT / "references" / "policy.json").read_text(encoding="utf-8"))
 if POLICY.get("schema_version") != 1:
     raise RuntimeError("Unsupported policy schema")
@@ -380,22 +380,6 @@ def bound_plan_hash(canonical: dict[str, Any], environment_fingerprint: str) -> 
     )
 
 
-def save_plan(kind: str, canonical: dict[str, Any], extra: dict[str, Any]) -> tuple[Path, str]:
-    plan_hash = bound_plan_hash(canonical, extra["environment_fingerprint"])
-    now = date_now()
-    plan_path = PLANS_DIR / f"{date_stamp()}-{uuid.uuid4().hex[:12]}.json"
-    manifest = {
-        "schema_version": 4,
-        "kind": kind,
-        "status": "prepared",
-        "created_at": now,
-        "plan_hash": plan_hash,
-        **extra,
-    }
-    atomic_json(plan_path, manifest)
-    return plan_path, plan_hash
-
-
 def read_message(ref: dict[str, Any], body: str = "full", include_headers: bool = False, include_source: bool = False) -> dict[str, Any]:
     return call_mail(
         "read",
@@ -680,10 +664,9 @@ def prepare_send(args: argparse.Namespace, operation: str) -> dict[str, Any]:
     if draft_outgoing_id < 1:
         raise MailCtlError("OUTGOING_NOT_BOUND", "Mail did not return a bound outgoing object for the prepared draft")
     canonical = send_canonical(operation, draft, source_ref, reply_all, sent_before, attachments, draft_outgoing_id)
-    plan_path, _ = save_plan(
-        "send",
-        canonical,
-        {
+    session_plan = {
+            "plan_hash": bound_plan_hash(canonical, environment["fingerprint"]),
+            "created_at": date_now(),
             "operation": operation,
             "draft_ref": draft["message_ref"],
             "source_ref": source_ref,
@@ -695,12 +678,12 @@ def prepare_send(args: argparse.Namespace, operation: str) -> dict[str, Any]:
             "draft_outgoing_id": draft_outgoing_id,
             "attachments": attachments,
             "environment_fingerprint": environment["fingerprint"],
-        },
-    )
+            "body_sha256": sha256_text(draft.get("body", "")),
+    }
     return {
         "ok": True,
         "operation": f"prepare-{operation}",
-        "plan_file": str(plan_path),
+        "session_plan": session_plan,
         "preview": {
             "sender": draft["sender"],
             "to": draft.get("to", []),
@@ -716,18 +699,6 @@ def prepare_send(args: argparse.Namespace, operation: str) -> dict[str, Any]:
             "sent_before": sent_before,
         },
     }
-
-
-def cmd_prepare_new(args: argparse.Namespace) -> dict[str, Any]:
-    return prepare_send(args, "new")
-
-
-def cmd_prepare_reply(args: argparse.Namespace) -> dict[str, Any]:
-    return prepare_send(args, "reply")
-
-
-def cmd_prepare_forward(args: argparse.Namespace) -> dict[str, Any]:
-    return prepare_send(args, "forward")
 
 
 def cmd_action(args: argparse.Namespace) -> dict[str, Any]:
@@ -806,24 +777,15 @@ def cmd_attachment_save(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
-def load_plan(path_text: str) -> tuple[Path, dict[str, Any]]:
-    path = Path(path_text).expanduser().resolve()
-    try:
-        path.relative_to(PLANS_DIR.resolve())
-    except ValueError as exc:
-        raise MailCtlError("INVALID_PLAN_PATH", f"Plan must be under {PLANS_DIR}") from exc
-    manifest = read_json(path)
-    if manifest.get("schema_version") not in (3, 4) or manifest.get("kind") != "send":
-        raise MailCtlError("INVALID_SEND_PLAN", "Only a current prepared send can be used")
-    return path, manifest
-
-
 @contextmanager
-def locked_send_plan(path: Path):
-    """Serialize a send across MCP/CLI processes before inspecting plan state."""
-    lock_path = path.with_name(path.name + ".lock")
+def locked_send():
+    """Serialize Mail sends with one installation-wide lock, not per-send files."""
+    if STATE_ROOT.is_symlink():
+        raise MailCtlError("INVALID_STATE", "Runtime state cannot be a symlink")
+    STATE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(STATE_ROOT, 0o700)
     try:
-        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        descriptor = os.open(SEND_LOCK, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     except OSError as exc:
         raise MailCtlError("PLAN_LOCK_FAILED", "Cannot open the send-plan lock") from exc
     try:
@@ -838,7 +800,10 @@ def locked_send_plan(path: Path):
         os.close(descriptor)
 
 
-def execute_send(path: Path, manifest: dict[str, Any], approved_hash: str) -> dict[str, Any]:
+def execute_send(manifest: dict[str, Any]) -> dict[str, Any]:
+    environment = mail_environment()
+    if manifest["environment_fingerprint"] != environment["fingerprint"]:
+        raise MailCtlError("STALE_PLAN", "The Mail environment changed after preparation")
     draft = call_mail("read_role_message", {"role": "drafts", "message_ref": manifest["draft_ref"], "body_mode": "full"})["message"]
     attachments = attachment_inputs([item["path"] for item in manifest.get("attachments", [])])
     if attachments != manifest.get("attachments", []):
@@ -853,91 +818,50 @@ def execute_send(path: Path, manifest: dict[str, Any], approved_hash: str) -> di
         int(manifest.get("draft_outgoing_id", -1)),
     )
     current_hash = bound_plan_hash(canonical, manifest["environment_fingerprint"])
-    if current_hash != approved_hash or current_hash != manifest["plan_hash"]:
+    if current_hash != manifest["plan_hash"]:
         raise MailCtlError(
             "STALE_PLAN",
             "The Mail draft or its live context changed after approval.",
-            {"approved_hash": approved_hash, "current_hash": current_hash, "preview": public_record(draft)},
+            {"current_hash": current_hash, "preview": public_record(draft)},
         )
     payload = send_prepared_payload(
         draft, manifest["operation"], manifest.get("source_ref"),
         bool(manifest.get("reply_all")), int(manifest["sent_before"]),
         [item["path"] for item in attachments], int(manifest.get("draft_outgoing_id", -1)),
     )
-    manifest.update({"status": "sending", "send_attempted_at": date_now()})
-    atomic_json(path, manifest)
     result = call_mail(
         "send_plan",
         payload,
         timeout=SEND_TIMEOUT,
     )
-    manifest.update(
-        {
-            "status": "sent" if result.get("sent_verified") else "ambiguous",
-            "executed_at": date_now(),
-            "sent_ref": result.get("sent", {}).get("message_ref"),
-            "sent_verified_at_send": bool(result.get("sent_verified")),
-            "draft_remaining": result.get("draft_remaining"),
-        }
-    )
-    atomic_json(path, manifest)
     return {
         "ok": True,
         "operation": "execute-send",
-        "plan_file": str(path),
         **result,
     }
 
 
-def cmd_execute(args: argparse.Namespace) -> dict[str, Any]:
-    path, _ = load_plan(args.plan_file)
-    with locked_send_plan(path):
-        path, manifest = load_plan(args.plan_file)
-        if manifest.get("kind") != "send":
-            raise MailCtlError("INVALID_PLAN_KIND", "Execute accepts prepared sends only")
-        if manifest.get("schema_version") != 4:
-            raise MailCtlError("STALE_PLAN", "Older prepared drafts cannot be sent with this version; prepare a new send")
-        environment = mail_environment()
-        if manifest.get("environment_fingerprint") and manifest["environment_fingerprint"] != environment["fingerprint"]:
-            raise MailCtlError("STALE_PLAN", "The environment fingerprint changed after preparation")
-        if manifest.get("status") != "prepared":
-            raise MailCtlError("PLAN_NOT_PREPARED", f"Plan status is {manifest.get('status')!r}; refusing to execute again")
-        return execute_send(path, manifest, manifest["plan_hash"])
-
-
-def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
-    path, manifest = load_plan(args.plan_file)
-    if manifest.get("status") == "sent" and manifest.get("sent_ref"):
-        return {
-            "ok": True, "operation": "verify", "plan_file": str(path), "status": "sent",
-            "sent_verified_at_send": manifest.get("sent_verified_at_send", True),
-            "sent_ref": manifest["sent_ref"], "current_location": "not_checked",
-            "draft_remaining_at_send": manifest.get("draft_remaining"),
-        }
-    if manifest.get("kind") == "send" and manifest.get("draft_ref"):
-        try:
-            draft = call_mail("read_role_message", {"role": "drafts", "message_ref": manifest["draft_ref"], "body_mode": "none"})["message"]
-        except MailCtlError:
-            draft = None
-        sender = draft["sender"] if draft else manifest.get("sender", "")
-        subject = draft["subject"] if draft else manifest.get("subject", "")
-        recipients = draft.get("to", []) if draft else manifest.get("to", [])
-        if not sender or not subject or not recipients:
-            raise MailCtlError("VERIFY_CONTEXT_MISSING", "Cannot verify an ambiguous send without its bound envelope")
-        count = call_mail(
-            "count_sent",
-            {"sender": sender, "subject": subject, "to": recipients},
-        )["count"]
-        return {
-            "ok": True,
-            "operation": "verify",
-            "plan_file": str(path),
-            "status": manifest["status"],
-            "sent_before": manifest["sent_before"],
-            "sent_now": count,
-            "draft_present": draft is not None,
-        }
-    return {"ok": True, "operation": "verify", "plan_file": str(path), "status": manifest.get("status")}
+def verify_send_evidence(plan: dict[str, Any]) -> dict[str, Any]:
+    """Read Mail evidence without turning a missing draft into proof of a send."""
+    try:
+        draft = call_mail("read_role_message", {"role": "drafts", "message_ref": plan["draft_ref"], "body_mode": "none"})["message"]
+    except MailCtlError:
+        draft = None
+    try:
+        sent = call_mail("verify_sent", {"sender": plan["sender"], "subject": plan["subject"], "to": plan["to"],
+                                         "since_age_seconds": max(0, parse_iso_age(plan["created_at"]) or 0)})
+    except MailCtlError as exc:
+        return {"ok": True, "operation": "verify", "status": "unknown", "draft_present": draft is not None,
+                "evidence_error": exc.code}
+    matches = [item for item in sent.get("candidates", [])
+               if sha256_text(item.get("body", "")) == plan["body_sha256"]]
+    confirmed = (sent.get("count") == plan["sent_before"] + 1
+                 and len(sent.get("candidates", [])) < 8 and len(matches) == 1)
+    return {"ok": True, "operation": "verify", "status": "confirmed_sent" if confirmed else "unknown",
+            "sent_before": plan["sent_before"], "sent_now": sent.get("count"),
+            "draft_present": draft is not None, "matching_sent_count": len(matches),
+            "sent_local_id": matches[0]["local_id"] if confirmed else None,
+            "verification_basis": "unique_matching_sent_after_prepare" if confirmed else "insufficient_mail_evidence"}
 
 
 def add_message_target(parser: argparse.ArgumentParser) -> None:
@@ -1056,33 +980,6 @@ def build_parser() -> argparse.ArgumentParser:
     add_message_target(attachment_list)
     attachment_list.set_defaults(func=cmd_attachment_list)
 
-    new = sub.add_parser("prepare-new")
-    new.add_argument("--account", required=True)
-    new.add_argument("--from", dest="from_address", required=True)
-    new.add_argument("--to", action="append", required=True)
-    new.add_argument("--cc", action="append", default=[])
-    new.add_argument("--bcc", action="append", default=[])
-    new.add_argument("--subject", required=True)
-    new.add_argument("--body-file", required=True)
-    new.add_argument("--attach", action="append", default=[])
-    new.set_defaults(func=cmd_prepare_new)
-
-    reply = sub.add_parser("prepare-reply")
-    add_message_target(reply)
-    reply.add_argument("--body-file", required=True)
-    reply.add_argument("--reply-all", action="store_true")
-    reply.add_argument("--attach", action="append", default=[])
-    reply.set_defaults(func=cmd_prepare_reply)
-
-    forward = sub.add_parser("prepare-forward")
-    add_message_target(forward)
-    forward.add_argument("--to", action="append", required=True)
-    forward.add_argument("--cc", action="append", default=[])
-    forward.add_argument("--bcc", action="append", default=[])
-    forward.add_argument("--body-file", required=True)
-    forward.add_argument("--attach", action="append", default=[])
-    forward.set_defaults(func=cmd_prepare_forward)
-
     action = sub.add_parser("action")
     action.add_argument("--operation", required=True, choices=["mark-read", "mark-unread", "flag", "unflag", "move", "trash"])
     add_message_target(action)
@@ -1096,17 +993,13 @@ def build_parser() -> argparse.ArgumentParser:
     attachment_save.add_argument("--output-dir", required=True)
     attachment_save.set_defaults(func=cmd_attachment_save)
 
-    execute = sub.add_parser("execute")
-    execute.add_argument("--plan-file", required=True)
-    execute.set_defaults(func=cmd_execute)
-
-    verify = sub.add_parser("verify")
-    verify.add_argument("--plan-file", required=True)
-    verify.set_defaults(func=cmd_verify)
     return parser
 
 
 def main() -> int:
+    if sys.version_info < (3, 14):
+        print("Python 3.14 or newer is required; run with uv run --no-project --python 3.14", file=sys.stderr)
+        return 2
     parser = build_parser()
     try:
         args = parser.parse_args()

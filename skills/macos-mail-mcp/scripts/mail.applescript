@@ -27,6 +27,8 @@ on run argv
             set responseObject to my commandReadRoleMessage(requestObject)
         else if commandName is "count_sent" then
             set responseObject to my commandCountSent(requestObject)
+        else if commandName is "verify_sent" then
+            set responseObject to my commandVerifySent(requestObject)
         else if commandName is "draft_new" then
             set responseObject to my commandDraftNew(requestObject)
         else if commandName is "draft_reply" then
@@ -1242,6 +1244,36 @@ using terms from application "Mail"
         my putValue(resultObject, "count", count of matches)
         return resultObject
     end commandCountSent
+
+
+    on commandVerifySent(requestObject)
+        set senderText to my requestText(requestObject, "sender", "")
+        set subjectText to my requestText(requestObject, "subject", "")
+        set toAddresses to my requestTextList(requestObject, "to")
+        set sinceAge to my requestInteger(requestObject, "since_age_seconds", 0)
+        set matches to my matchingRoleMessages("sent", senderText, subjectText, toAddresses)
+        set candidates to my newArray()
+        set cutoff to (current date) - sinceAge - 60
+        tell application "Mail"
+            repeat with aMessage in matches
+                try
+                    if (date sent of aMessage) ≥ cutoff then
+                        set itemObject to my newDictionary()
+                        my putValue(itemObject, "body", content of aMessage as text)
+                        my putValue(itemObject, "local_id", id of aMessage as integer)
+                        my addValue(candidates, itemObject)
+                        if (candidates's |count|() as integer) ≥ 8 then exit repeat
+                    end if
+                end try
+            end repeat
+        end tell
+        set resultObject to my newDictionary()
+        my putValue(resultObject, "ok", true)
+        my putValue(resultObject, "operation", "verify-sent")
+        my putValue(resultObject, "count", count of matches)
+        my putValue(resultObject, "candidates", candidates)
+        return resultObject
+    end commandVerifySent
 
 
     on messageIDs(messageObjects)

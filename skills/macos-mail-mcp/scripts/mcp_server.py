@@ -5,9 +5,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
-import re
-from pathlib import Path
+import os
+import secrets
+import stat
+import threading
+import tempfile
+import uuid
 from typing import Any, Literal
 
 from mcp.server.mcpserver import MCPServer
@@ -45,7 +52,7 @@ server = MCPServer(
         "Use returned message_ref values for changes. Check complete and per-message verification. "
         "Do not retry an uncertain send, permanently delete mail, or empty Trash."
     ),
-    version="0.2.1",
+    version="0.3.0",
 )
 
 
@@ -73,10 +80,121 @@ def _target_args(ref: MessageRef) -> dict[str, Any]:
     }
 
 
-def _plan_path(plan_id: str) -> str:
-    if not re.fullmatch(r"\d{8}-\d{6}-[0-9a-f]{12}", plan_id):
-        raise service.MailCtlError("INVALID_PLAN_ID", "Use the plan_id returned by mail_prepare")
-    return str(service.PLANS_DIR / f"{plan_id}.json")
+class SendSession:
+    """Keep send attempts in one MCP process; signed tokens allow later read-only checks."""
+
+    def __init__(self) -> None:
+        self.session_id = uuid.uuid4().hex
+        self._guard = threading.Lock()
+        self._records: dict[str, dict[str, Any]] = {}
+        self._key: bytes | None = None
+
+    def _signing_key(self) -> bytes:
+        if self._key is not None:
+            return self._key
+        root = service.STATE_ROOT
+        if root.is_symlink():
+            raise service.MailCtlError("INVALID_STATE", "Runtime state cannot be a symlink")
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(root, 0o700)
+        path = root / "send-token.key"
+        if path.is_symlink():
+            raise service.MailCtlError("INVALID_STATE", "Send token key cannot be a symlink")
+        if not path.exists():
+            fd, temporary = tempfile.mkstemp(prefix=".send-key-", dir=root)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    os.fchmod(handle.fileno(), 0o600)
+                    handle.write(secrets.token_bytes(32))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    os.link(temporary, path, follow_symlinks=False)
+                except FileExistsError:
+                    pass
+            finally:
+                os.unlink(temporary)
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError as exc:
+            raise service.MailCtlError("INVALID_STATE", "Cannot open send token key") from exc
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+                raise service.MailCtlError("INVALID_STATE", "Send token key is not a private regular file")
+            key = os.read(fd, 33)
+        finally:
+            os.close(fd)
+        if len(key) != 32:
+            raise service.MailCtlError("INVALID_STATE", "Send token key has an invalid length")
+        self._key = key
+        return key
+
+    def issue(self, plan: dict[str, Any]) -> str:
+        nonce = secrets.token_hex(16)
+        payload = {"v": 1, "session": self.session_id, "nonce": nonce,
+                   "created_at": plan["created_at"], "draft_ref": plan["draft_ref"],
+                   "sender": plan["sender"], "to": plan["to"], "subject": plan["subject"],
+                   "sent_before": plan["sent_before"], "body_sha256": plan["body_sha256"]}
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        signed = raw + hmac.digest(self._signing_key(), raw, "sha256")
+        token = base64.urlsafe_b64encode(signed).rstrip(b"=").decode("ascii")
+        with self._guard:
+            self._records[nonce] = {"status": "prepared", "plan": plan, "result": None}
+        return token
+
+    def decode(self, token: str) -> dict[str, Any]:
+        if len(token) > 8192 or not token or any(ch not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_" for ch in token):
+            raise service.MailCtlError("INVALID_PLAN_TOKEN", "Use the token returned by mail_prepare")
+        try:
+            signed = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+            raw, signature = signed[:-32], signed[-32:]
+            if len(signature) != 32 or not hmac.compare_digest(signature, hmac.digest(self._signing_key(), raw, "sha256")):
+                raise ValueError("signature")
+            payload = json.loads(raw)
+            if (not isinstance(payload, dict) or payload.get("v") != 1
+                    or not isinstance(payload.get("session"), str)
+                    or not isinstance(payload.get("nonce"), str)
+                    or not isinstance(payload.get("created_at"), str)
+                    or not isinstance(payload.get("draft_ref"), dict)
+                    or not isinstance(payload.get("sender"), str)
+                    or not isinstance(payload.get("to"), list)
+                    or not all(isinstance(address, str) for address in payload["to"])
+                    or not isinstance(payload.get("subject"), str)
+                    or type(payload.get("sent_before")) is not int
+                    or not isinstance(payload.get("body_sha256"), str)):
+                raise ValueError("payload")
+            return payload
+        except (ValueError, TypeError, KeyError) as exc:
+            raise service.MailCtlError("INVALID_PLAN_TOKEN", "Invalid send token") from exc
+
+    def consume(self, token: str) -> dict[str, Any]:
+        payload = self.decode(token)
+        if payload.get("session") != self.session_id:
+            raise service.MailCtlError("SESSION_EXPIRED", "This send token belongs to an earlier MCP session; verify Mail before preparing again")
+        with self._guard:
+            record = self._records.get(payload["nonce"])
+            if record is None or record["status"] != "prepared":
+                raise service.MailCtlError("PLAN_NOT_PREPARED", "This send token has already been used or is unavailable")
+            record["status"] = "attempted"
+            return record["plan"]
+
+    def finish(self, token: str) -> None:
+        payload = self.decode(token)
+        with self._guard:
+            self._records.pop(payload["nonce"], None)
+
+
+_send_session = SendSession()
+
+
+def _execute_bound_send(token: str) -> dict[str, Any]:
+    with service.locked_send():
+        plan = _send_session.consume(token)
+        try:
+            return service.execute_send(plan)
+        finally:
+            _send_session.finish(token)
 
 
 @server.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True), structured_output=True)
@@ -203,7 +321,7 @@ async def mail_prepare(
     reply_all: bool = False,
     attachments: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Prepare and verify a bound Mail draft; return its preview and internal plan_id."""
+    """Prepare a bound Mail draft; return its preview and a session-bound send token."""
     if kind == "new" and (not account or not from_address or not to or not subject or source_ref):
         return {"ok": False, "code": "INVALID_PREPARE_ARGS", "error": "New mail needs account, from_address, to and subject"}
     if kind != "new" and source_ref is None:
@@ -215,34 +333,30 @@ async def mail_prepare(
                   from_address=from_address, to=to or [], cc=cc or [], bcc=bcc or [],
                   subject=subject, body_text=body, attach=attachments or [], reply_all=reply_all)
     args = argparse.Namespace(**values)
+    try:
+        _send_session._signing_key()
+    except service.MailCtlError as exc:
+        return {"ok": False, "code": exc.code, "error": exc.message}
     result = await _call(service.prepare_send, args, kind)
-    if result.get("ok") and result.get("plan_file"):
-        result["plan_id"] = Path(result.pop("plan_file")).stem
+    if result.get("ok") and result.get("session_plan"):
+        result["plan_token"] = _send_session.issue(result.pop("session_plan"))
     return result
 
 
 @server.tool(annotations=ToolAnnotations(destructiveHint=True, openWorldHint=True), structured_output=True)
-async def mail_send(plan_id: str) -> dict[str, Any]:
+async def mail_send(plan_token: str) -> dict[str, Any]:
     """Send the prepared Mail outgoing object once; verify Sent and never auto-retry."""
-    try:
-        path = _plan_path(plan_id)
-    except service.MailCtlError as exc:
-        return {"ok": False, "code": exc.code, "error": exc.message}
-    result = await _call(service.cmd_execute, argparse.Namespace(plan_file=path))
-    result.pop("plan_file", None)
-    return result
+    return await _call(_execute_bound_send, plan_token)
 
 
 @server.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False), structured_output=True)
-async def mail_verify(plan_id: str) -> dict[str, Any]:
-    """Inspect a send receipt or unresolved plan without resending; location is separate."""
+async def mail_verify(plan_token: str) -> dict[str, Any]:
+    """Inspect current session results or Mail evidence without resending."""
     try:
-        path = _plan_path(plan_id)
+        payload = _send_session.decode(plan_token)
     except service.MailCtlError as exc:
         return {"ok": False, "code": exc.code, "error": exc.message}
-    result = await _call(service.cmd_verify, argparse.Namespace(plan_file=path))
-    result.pop("plan_file", None)
-    return result
+    return await _call(service.verify_send_evidence, payload)
 
 
 @server.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False), structured_output=True)

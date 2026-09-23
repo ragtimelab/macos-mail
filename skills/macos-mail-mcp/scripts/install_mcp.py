@@ -16,7 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SERVER = ROOT / "scripts" / "mcp_server.py"
 RUNTIME_LOCK = ROOT / "requirements-mcp.lock"
 BUILD_LOCK = ROOT / "requirements-build.lock"
-VENV = Path.home() / "Library" / "Application Support" / "macos-mail-mcp" / "mcp-venv"
+STATE = Path(os.environ.get("MACOS_MAIL_MCP_STATE_DIR", Path.home() / "Library" / "Application Support" / "macos-mail-mcp")).expanduser().absolute()
+VENV = STATE / "mcp-venv"
 NAME = "macos-mail-mcp"
 
 
@@ -28,30 +29,63 @@ def python() -> str:
     return str(VENV / "bin" / "python")
 
 
-def ensure_runtime() -> None:
-    if sys.platform != "darwin" or sys.version_info < (3, 10):
-        raise RuntimeError("macOS and Python 3.10 or newer are required")
-    uv = shutil.which("uv")
-    if not uv:
-        raise RuntimeError("uv is required to install the MCP runtime; see https://docs.astral.sh/uv/getting-started/installation/")
-    if not RUNTIME_LOCK.is_file() or not BUILD_LOCK.is_file():
-        raise RuntimeError("The bundled MCP dependency locks are missing")
+def runtime_version() -> tuple[int, int] | None:
     if not (VENV / "pyvenv.cfg").exists():
-        VENV.parent.mkdir(parents=True, exist_ok=True)
-        run(uv, "venv", str(VENV), "--python", sys.executable)
+        return None
+    try:
+        result = run(python(), "-c", "import sys; print(sys.version_info.major, sys.version_info.minor)")
+        major, minor = result.stdout.strip().split()
+        return int(major), int(minor)
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return (0, 0)
+
+
+def sync_runtime(uv: str) -> None:
     run(uv, "pip", "sync", "--python", python(), "--require-hashes", "--strict", str(RUNTIME_LOCK))
     try:
         run(python(), "-c", "from mcp.server.mcpserver import MCPServer")
     except subprocess.CalledProcessError as exc:
         if "cryptography" not in exc.stderr and "libssl" not in exc.stderr:
             raise RuntimeError(exc.stderr) from exc
-        # Some Python distributors ship a cryptography wheel linked to a
-        # different OpenSSL prefix. Rebuild only the locked sdist, with locked
-        # build dependencies, against this host's toolchain.
         run(uv, "pip", "sync", "--python", python(), "--require-hashes", "--strict",
             "--reinstall-package", "cryptography", "--no-binary", "cryptography",
             "--no-cache", "--build-constraints", str(BUILD_LOCK), str(RUNTIME_LOCK))
         run(python(), "-c", "from mcp.server.mcpserver import MCPServer")
+
+
+def ensure_runtime() -> None:
+    if sys.platform != "darwin" or sys.version_info < (3, 14):
+        raise RuntimeError("macOS and Python 3.14 or newer are required; start this installer with uv run --python 3.14")
+    uv = shutil.which("uv")
+    if not uv:
+        raise RuntimeError("uv is required to install the MCP runtime; see https://docs.astral.sh/uv/getting-started/installation/")
+    if not RUNTIME_LOCK.is_file() or not BUILD_LOCK.is_file():
+        raise RuntimeError("The bundled MCP dependency locks are missing")
+    if STATE.is_symlink() or VENV.is_symlink():
+        raise RuntimeError("Runtime state and virtual environment cannot be symbolic links")
+    VENV.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(VENV.parent, 0o700)
+    existing_version = runtime_version()
+    if existing_version is not None and existing_version >= (3, 14):
+        sync_runtime(uv)
+        print(f"MCP runtime ready: {python()}")
+        return
+    old = VENV.with_name(VENV.name + ".upgrade-old")
+    if os.path.lexists(old):
+        raise RuntimeError(f"Previous runtime upgrade is incomplete; inspect {old}")
+    if VENV.exists():
+        VENV.rename(old)
+    try:
+        run(uv, "venv", str(VENV), "--python", "3.14")
+        sync_runtime(uv)
+    except BaseException:
+        if VENV.exists():
+            shutil.rmtree(VENV)
+        if old.exists():
+            old.rename(VENV)
+        raise
+    if old.exists():
+        shutil.rmtree(old)
     print(f"MCP runtime ready: {python()}")
 
 

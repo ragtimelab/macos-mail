@@ -30,6 +30,9 @@ def main() -> int:
         if not name:
             continue
         path = ROOT / name
+        if not path.exists():
+            # A tracked file may be deleted in the working tree before staging.
+            continue
         data = path.read_bytes()
         if b"\0" in data:
             continue
