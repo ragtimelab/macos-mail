@@ -46,7 +46,18 @@ def main() -> int:
     base = args.base.lower()
     if base and not re.fullmatch(r"[0-9a-f]{40}", base):
         parser.error("--base must be a 40-character commit SHA")
-    commits = git("rev-list", f"{base}..HEAD" if base and int(base, 16) else "HEAD").splitlines()
+    if base and not int(base, 16):
+        # GitHub supplies an all-zero before SHA for the first push of a branch.
+        # Compare that branch with main instead of rechecking retained history.
+        try:
+            branch_base = git("merge-base", "HEAD", "origin/main")
+            if branch_base != git("rev-parse", "HEAD"):
+                base = branch_base
+            else:
+                base = git("rev-parse", "HEAD^")
+        except subprocess.CalledProcessError:
+            base = ""
+    commits = git("rev-list", f"{base}..HEAD" if base else "HEAD").splitlines()
     for sha in commits:
         for email in git("show", "-s", "--format=%ae%n%ce", sha).splitlines():
             if email.rsplit("@", 1)[-1].lower() not in ALLOWED_EMAIL_DOMAINS:
