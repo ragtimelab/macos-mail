@@ -4,8 +4,12 @@ import argparse
 import contextlib
 import io
 import json
+import os
+import stat
+import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -207,6 +211,83 @@ class MailCliTests(unittest.TestCase):
         with self.assertRaises(mail.MailCtlError) as missing:
             mail.send_prepared_payload(draft, "new", None, False, 0, [], 19)
         self.assertEqual(missing.exception.code, "RECIPIENT_REQUIRED")
+
+    def test_attachment_save_is_private_and_never_overwrites(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory)
+            os.chmod(output_dir, 0o755)
+            args = argparse.Namespace(account="Example", mailbox_json='["INBOX"]', mailbox=None,
+                                      id=17, rfc_message_id="<17@example.test>", universal_id="",
+                                      attachment_id="attachment-1", output_dir=directory)
+            message = {"message_ref": ref(), "attachments": [{"id": "attachment-1", "name": "report.txt"}]}
+
+            def save(_command, payload, **_kwargs):
+                staged = Path(payload["output_path"])
+                staged.write_bytes(b"private attachment")
+                os.chmod(staged, 0o644)
+                return {"ok": True, "output_path": str(staged)}
+
+            with patch.object(mail, "read_message", return_value=message), patch.object(mail, "call_mail", side_effect=save):
+                result = mail.cmd_attachment_save(args)
+            output = output_dir / "report.txt"
+            self.assertEqual(Path(result["output_path"]), output.resolve())
+            self.assertEqual(output.read_bytes(), b"private attachment")
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+            self.assertEqual(list(output_dir.glob(".macos-mail-*")), [])
+            with patch.object(mail, "read_message", return_value=message), patch.object(mail, "call_mail") as called:
+                with self.assertRaises(mail.MailCtlError) as existing:
+                    mail.cmd_attachment_save(args)
+            self.assertEqual(existing.exception.code, "NO_OVERWRITE")
+            called.assert_not_called()
+
+    def test_broken_symlink_and_hidden_attachment_names_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args = argparse.Namespace(account="Example", mailbox_json='["INBOX"]', mailbox=None,
+                                      id=17, rfc_message_id="<17@example.test>", universal_id="",
+                                      attachment_id="attachment-1", output_dir=directory)
+            message = {"message_ref": ref(), "attachments": [{"id": "attachment-1", "name": "report.txt"}]}
+            (Path(directory) / "report.txt").symlink_to(Path(directory) / "missing")
+            with patch.object(mail, "read_message", return_value=message), patch.object(mail, "call_mail") as called:
+                with self.assertRaises(mail.MailCtlError) as existing:
+                    mail.cmd_attachment_save(args)
+            self.assertEqual(existing.exception.code, "NO_OVERWRITE")
+            called.assert_not_called()
+            message["attachments"][0]["name"] = ".zshenv"
+            with patch.object(mail, "read_message", return_value=message):
+                with self.assertRaises(mail.MailCtlError) as unsafe:
+                    mail.cmd_attachment_save(args)
+            self.assertEqual(unsafe.exception.code, "UNSAFE_ATTACHMENT_NAME")
+
+    def test_send_plan_lock_rejects_a_concurrent_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plan.json"
+
+            def contend():
+                with self.assertRaises(mail.MailCtlError) as busy:
+                    with mail.locked_send_plan(path):
+                        pass
+                return busy.exception.code
+
+            with mail.locked_send_plan(path), ThreadPoolExecutor(max_workers=1) as pool:
+                self.assertEqual(pool.submit(contend).result(), "PLAN_BUSY")
+            self.assertEqual(stat.S_IMODE((Path(directory) / "plan.json.lock").stat().st_mode), 0o600)
+
+    def test_mail_output_and_prepare_inputs_are_bounded(self) -> None:
+        with patch.object(mail, "MAX_MAIL_RESPONSE_BYTES", 16):
+            with self.assertRaises(mail.MailCtlError) as oversized:
+                mail.run_command([sys.executable, "-c", "print('x' * 32)"])
+        self.assertEqual(oversized.exception.code, "RESPONSE_TOO_LARGE")
+        with patch.object(mail, "MAX_BODY_BYTES", 4):
+            with self.assertRaises(mail.MailCtlError) as body:
+                mail.normalize_body_text("12345")
+        self.assertEqual(body.exception.code, "BODY_TOO_LARGE")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "large.bin"
+            path.write_bytes(b"12345")
+            with patch.object(mail, "MAX_ATTACHMENT_TOTAL_BYTES", 4):
+                with self.assertRaises(mail.MailCtlError) as attachment:
+                    mail.attachment_inputs([str(path)])
+            self.assertEqual(attachment.exception.code, "ATTACHMENTS_TOO_LARGE")
 
 
 if __name__ == "__main__":

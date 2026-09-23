@@ -45,7 +45,7 @@ server = MCPServer(
         "Use returned message_ref values for changes. Check complete and per-message verification. "
         "Do not retry an uncertain send, permanently delete mail, or empty Trash."
     ),
-    version="0.1.2",
+    version="0.1.3",
 )
 
 
@@ -79,7 +79,7 @@ def _plan_path(plan_id: str) -> str:
     return str(service.PLANS_DIR / f"{plan_id}.json")
 
 
-@server.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False), structured_output=True)
+@server.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True), structured_output=True)
 async def mail_recent(
     unread: bool = False,
     limit: int = Field(default=3, ge=1, le=200),
@@ -95,7 +95,7 @@ async def mail_recent(
     return await _call(service.cmd_recent, args)
 
 
-@server.tool(annotations=ToolAnnotations(openWorldHint=False), structured_output=True)
+@server.tool(annotations=ToolAnnotations(openWorldHint=True), structured_output=True)
 async def mail_find(
     scope: Literal["all_inboxes", "mailbox"],
     sender: str | None = None,
@@ -130,7 +130,7 @@ async def mail_find(
     return await _call(service.cmd_inspect, args)
 
 
-@server.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False), structured_output=True)
+@server.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True), structured_output=True)
 async def mail_read(
     message_ref: MessageRef,
     body: Literal["none", "excerpt", "full"] = "full",
@@ -152,7 +152,7 @@ async def mail_catalog(kind: Literal["accounts", "mailboxes"], account: str | No
     return await _call(function, argparse.Namespace(account=account))
 
 
-@server.tool(annotations=ToolAnnotations(destructiveHint=True, openWorldHint=False), structured_output=True)
+@server.tool(annotations=ToolAnnotations(destructiveHint=True, openWorldHint=True), structured_output=True)
 async def mail_change(
     refs: list[MessageRef],
     actions: list[Literal["mark-read", "mark-unread", "flag", "unflag", "move", "trash"]],
@@ -175,7 +175,7 @@ async def mail_change(
     return await _call(service.cmd_action, args)
 
 
-@server.tool(annotations=ToolAnnotations(openWorldHint=False), structured_output=True)
+@server.tool(annotations=ToolAnnotations(destructiveHint=False, openWorldHint=True), structured_output=True)
 async def mail_attachments(
     message_ref: MessageRef,
     operation: Literal["list", "save"] = "list",
@@ -189,7 +189,7 @@ async def mail_attachments(
     return await _call(service.cmd_attachment_list if operation == "list" else service.cmd_attachment_save, args)
 
 
-@server.tool(annotations=ToolAnnotations(openWorldHint=False), structured_output=True)
+@server.tool(annotations=ToolAnnotations(destructiveHint=False, openWorldHint=True), structured_output=True)
 async def mail_prepare(
     kind: Literal["new", "reply", "forward"],
     body: str,
@@ -221,7 +221,7 @@ async def mail_prepare(
     return result
 
 
-@server.tool(annotations=ToolAnnotations(destructiveHint=True, openWorldHint=False), structured_output=True)
+@server.tool(annotations=ToolAnnotations(destructiveHint=True, openWorldHint=True), structured_output=True)
 async def mail_send(plan_id: str) -> dict[str, Any]:
     """Send the prepared Mail outgoing object once; verify Sent and never auto-retry."""
     try:

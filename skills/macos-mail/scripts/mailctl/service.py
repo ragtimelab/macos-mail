@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
@@ -15,6 +17,7 @@ import sys
 import tempfile
 import time
 import uuid
+import stat
 from email.utils import parseaddr
 from pathlib import Path
 from typing import Any
@@ -48,6 +51,10 @@ if SEND_TIMEOUT < MINIMUM_SEND_TIMEOUT:
     raise RuntimeError("send_timeout_seconds is smaller than the configured preflight and verification budget")
 
 LOCATE_DEFAULT_WINDOW_SECONDS = 14 * 24 * 60 * 60
+MAX_BODY_BYTES = 1024 * 1024
+MAX_ATTACHMENTS = 20
+MAX_ATTACHMENT_TOTAL_BYTES = 100 * 1024 * 1024
+MAX_MAIL_RESPONSE_BYTES = 8 * 1024 * 1024
 
 
 class MailCtlError(RuntimeError):
@@ -126,7 +133,17 @@ def read_json(path: Path) -> dict[str, Any]:
 
 def run_command(argv: list[str], timeout: int = DEFAULT_TIMEOUT) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(argv, text=True, capture_output=True, timeout=timeout, check=False)
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            result = subprocess.run(argv, stdout=stdout, stderr=stderr, timeout=timeout, check=False)
+            if stdout.tell() > MAX_MAIL_RESPONSE_BYTES:
+                raise MailCtlError("RESPONSE_TOO_LARGE", "Mail returned more than 8 MiB; narrow the result or use excerpts")
+            stdout.seek(0)
+            stderr.seek(0)
+            return subprocess.CompletedProcess(
+                argv, result.returncode,
+                stdout.read().decode("utf-8", errors="replace"),
+                stderr.read(64 * 1024).decode("utf-8", errors="replace"),
+            )
     except subprocess.TimeoutExpired as exc:
         raise MailCtlError("TIMEOUT", f"Command timed out after {timeout} seconds", {"argv": argv[:2]}) from exc
 
@@ -199,7 +216,10 @@ def load_body(path_text: str) -> str:
     path = Path(path_text).expanduser().resolve()
     if not path.is_file():
         raise MailCtlError("BODY_FILE_NOT_FOUND", f"Body file not found: {path}")
-    raw = path.read_bytes()
+    with path.open("rb") as handle:
+        raw = handle.read(MAX_BODY_BYTES + 1)
+    if len(raw) > MAX_BODY_BYTES:
+        raise MailCtlError("BODY_TOO_LARGE", "Message body exceeds 1 MiB")
     try:
         body = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -210,7 +230,10 @@ def load_body(path_text: str) -> str:
 def normalize_body_text(body: str) -> str:
     if not isinstance(body, str) or not body.strip():
         raise MailCtlError("EMPTY_BODY", "Message body must not be empty")
-    return body.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = body.replace("\r\n", "\n").replace("\r", "\n")
+    if len(normalized.encode("utf-8")) > MAX_BODY_BYTES:
+        raise MailCtlError("BODY_TOO_LARGE", "Message body exceeds 1 MiB")
+    return normalized
 
 
 def mailbox_path(args: argparse.Namespace, field: str = "mailbox") -> list[str]:
@@ -247,8 +270,11 @@ def public_record(record: dict[str, Any], include_body: bool = True) -> dict[str
 
 
 def attachment_inputs(path_values: list[str]) -> list[dict[str, Any]]:
+    if len(path_values) > MAX_ATTACHMENTS:
+        raise MailCtlError("TOO_MANY_ATTACHMENTS", "At most 20 attachments are supported")
     results = []
     seen: set[str] = set()
+    total_size = 0
     for value in path_values:
         path = Path(value).expanduser().resolve()
         if not path.is_file():
@@ -256,7 +282,23 @@ def attachment_inputs(path_values: list[str]) -> list[dict[str, Any]]:
         if str(path) in seen:
             raise MailCtlError("DUPLICATE_ATTACHMENT", f"Attachment path was repeated: {path}")
         seen.add(str(path))
-        results.append({"path": str(path), "name": path.name, "size": path.stat().st_size, "sha256": sha256_bytes(path.read_bytes())})
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            file_stat = os.fstat(handle.fileno())
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise MailCtlError("ATTACHMENT_NOT_REGULAR", f"Attachment is not a regular file: {path}")
+            total_size += file_stat.st_size
+            if total_size > MAX_ATTACHMENT_TOTAL_BYTES:
+                raise MailCtlError("ATTACHMENTS_TOO_LARGE", "Attachments exceed 100 MiB in total")
+            scanned_size = 0
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                scanned_size += len(chunk)
+                if total_size - file_stat.st_size + scanned_size > MAX_ATTACHMENT_TOTAL_BYTES:
+                    raise MailCtlError("ATTACHMENTS_TOO_LARGE", "Attachments exceed 100 MiB in total")
+                digest.update(chunk)
+            if scanned_size != file_stat.st_size or os.fstat(handle.fileno()).st_size != file_stat.st_size:
+                raise MailCtlError("ATTACHMENT_CHANGED", f"Attachment changed while hashing: {path}")
+        results.append({"path": str(path), "name": path.name, "size": file_stat.st_size, "sha256": digest.hexdigest()})
     return results
 
 
@@ -667,6 +709,7 @@ def prepare_send(args: argparse.Namespace, operation: str) -> dict[str, Any]:
             "subject": draft["subject"],
             "body": draft.get("body", ""),
             "attachments": draft.get("attachments", []),
+            "attachment_files": attachments,
         },
         "verification": {
             "draft_count_delta": 1,
@@ -718,20 +761,48 @@ def cmd_attachment_save(args: argparse.Namespace) -> dict[str, Any]:
     if not output_dir.is_dir():
         raise MailCtlError("OUTPUT_DIR_NOT_FOUND", f"Output directory not found: {output_dir}")
     safe_name = Path(matches[0]["name"]).name
-    if not safe_name or safe_name in {".", ".."}:
+    if not safe_name or safe_name in {".", ".."} or safe_name.startswith("."):
         raise MailCtlError("UNSAFE_ATTACHMENT_NAME", "Attachment name is unsafe")
     output = output_dir / safe_name
-    if output.exists():
+    if os.path.lexists(output):
         raise MailCtlError("NO_OVERWRITE", f"Refusing to overwrite: {output}")
-    result = call_mail(
-        "apply_action",
-        {"operation": "save-attachment", "message_ref": record["message_ref"], "attachment_id": args.attachment_id, "output_path": str(output)},
-        timeout=SEND_TIMEOUT,
-    )
-    if not output.is_file():
-        raise MailCtlError("SAVE_VERIFICATION_FAILED", f"Attachment was not created: {output}")
-    result["saved_sha256"] = sha256_bytes(output.read_bytes())
-    result["saved_size"] = output.stat().st_size
+    with tempfile.TemporaryDirectory(prefix=".macos-mail-", dir=output_dir) as private_dir:
+        os.chmod(private_dir, 0o700)
+        staged = Path(private_dir) / safe_name
+        result = call_mail(
+            "apply_action",
+            {"operation": "save-attachment", "message_ref": record["message_ref"], "attachment_id": args.attachment_id, "output_path": str(staged)},
+            timeout=SEND_TIMEOUT,
+        )
+        try:
+            descriptor = os.open(staged, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError as exc:
+            raise MailCtlError("SAVE_VERIFICATION_FAILED", "Mail did not create a safe attachment file") from exc
+        with os.fdopen(descriptor, "rb") as handle:
+            file_stat = os.fstat(handle.fileno())
+            if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_uid != os.getuid():
+                raise MailCtlError("SAVE_VERIFICATION_FAILED", "Mail did not create an owned regular file")
+            os.fchmod(handle.fileno(), 0o600)
+            digest = hashlib.sha256()
+            saved_size = 0
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+                saved_size += len(chunk)
+            if saved_size != file_stat.st_size:
+                raise MailCtlError("SAVE_VERIFICATION_FAILED", "Attachment changed during verification")
+            try:
+                os.link(staged, output, follow_symlinks=False)
+            except FileExistsError as exc:
+                raise MailCtlError("NO_OVERWRITE", f"Refusing to overwrite: {output}") from exc
+            except OSError as exc:
+                raise MailCtlError("SAVE_PUBLISH_FAILED", "Cannot publish attachment atomically in this directory") from exc
+        published = output.lstat()
+        if not stat.S_ISREG(published.st_mode) or published.st_ino != file_stat.st_ino or published.st_dev != file_stat.st_dev or published.st_mode & 0o077:
+            output.unlink(missing_ok=True)
+            raise MailCtlError("SAVE_VERIFICATION_FAILED", "Published attachment did not match the private file")
+    result["output_path"] = str(output)
+    result["saved_sha256"] = digest.hexdigest()
+    result["saved_size"] = saved_size
     return result
 
 
@@ -745,6 +816,26 @@ def load_plan(path_text: str) -> tuple[Path, dict[str, Any]]:
     if manifest.get("schema_version") not in (3, 4) or manifest.get("kind") != "send":
         raise MailCtlError("INVALID_SEND_PLAN", "Only a current prepared send can be used")
     return path, manifest
+
+
+@contextmanager
+def locked_send_plan(path: Path):
+    """Serialize a send across MCP/CLI processes before inspecting plan state."""
+    lock_path = path.with_name(path.name + ".lock")
+    try:
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        raise MailCtlError("PLAN_LOCK_FAILED", "Cannot open the send-plan lock") from exc
+    try:
+        os.fchmod(descriptor, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise MailCtlError("PLAN_BUSY", "This send plan is already being executed; verify it before another attempt") from exc
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def execute_send(path: Path, manifest: dict[str, Any], approved_hash: str) -> dict[str, Any]:
@@ -799,17 +890,19 @@ def execute_send(path: Path, manifest: dict[str, Any], approved_hash: str) -> di
 
 
 def cmd_execute(args: argparse.Namespace) -> dict[str, Any]:
-    path, manifest = load_plan(args.plan_file)
-    if manifest.get("kind") != "send":
-        raise MailCtlError("INVALID_PLAN_KIND", "Execute accepts prepared sends only")
-    if manifest.get("schema_version") != 4:
-        raise MailCtlError("STALE_PLAN", "Older prepared drafts cannot be sent with this version; prepare a new send")
-    environment = mail_environment()
-    if manifest.get("environment_fingerprint") and manifest["environment_fingerprint"] != environment["fingerprint"]:
-        raise MailCtlError("STALE_PLAN", "The environment fingerprint changed after preparation")
-    if manifest.get("status") != "prepared":
-        raise MailCtlError("PLAN_NOT_PREPARED", f"Plan status is {manifest.get('status')!r}; refusing to execute again")
-    return execute_send(path, manifest, manifest["plan_hash"])
+    path, _ = load_plan(args.plan_file)
+    with locked_send_plan(path):
+        path, manifest = load_plan(args.plan_file)
+        if manifest.get("kind") != "send":
+            raise MailCtlError("INVALID_PLAN_KIND", "Execute accepts prepared sends only")
+        if manifest.get("schema_version") != 4:
+            raise MailCtlError("STALE_PLAN", "Older prepared drafts cannot be sent with this version; prepare a new send")
+        environment = mail_environment()
+        if manifest.get("environment_fingerprint") and manifest["environment_fingerprint"] != environment["fingerprint"]:
+            raise MailCtlError("STALE_PLAN", "The environment fingerprint changed after preparation")
+        if manifest.get("status") != "prepared":
+            raise MailCtlError("PLAN_NOT_PREPARED", f"Plan status is {manifest.get('status')!r}; refusing to execute again")
+        return execute_send(path, manifest, manifest["plan_hash"])
 
 
 def cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
