@@ -26,7 +26,7 @@ SKILL_ROOT = Path(__file__).resolve().parents[2]
 APPLESCRIPT = SKILL_ROOT / "scripts" / "mail.applescript"
 MAIL_APP: Path | None = None
 MAIL_SDEF: Path | None = None
-STATE_ROOT = Path(os.environ.get("MACOS_MAIL_STATE_DIR", Path.home() / "Library" / "Application Support" / "macos-mail")).expanduser().resolve()
+STATE_ROOT = Path(os.environ.get("MACOS_MAIL_MCP_STATE_DIR", Path.home() / "Library" / "Application Support" / "macos-mail-mcp")).expanduser().resolve()
 PLANS_DIR = STATE_ROOT / "plans"
 POLICY = json.loads((SKILL_ROOT / "references" / "policy.json").read_text(encoding="utf-8"))
 if POLICY.get("schema_version") != 1:
@@ -156,7 +156,7 @@ def call_mail(command: str, payload: dict[str, Any] | None = None, timeout: int 
         "send_verification_attempts": POLICY["send_verification_attempts"],
         **(payload or {}),
     }
-    with tempfile.TemporaryDirectory(prefix="macos-mail-") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="macos-mail-mcp-") as temp_dir:
         temp_path = Path(temp_dir)
         os.chmod(temp_path, 0o700)
         request_path = temp_path / "request.json"
@@ -766,7 +766,7 @@ def cmd_attachment_save(args: argparse.Namespace) -> dict[str, Any]:
     output = output_dir / safe_name
     if os.path.lexists(output):
         raise MailCtlError("NO_OVERWRITE", f"Refusing to overwrite: {output}")
-    with tempfile.TemporaryDirectory(prefix=".macos-mail-", dir=output_dir) as private_dir:
+    with tempfile.TemporaryDirectory(prefix=".macos-mail-mcp-", dir=output_dir) as private_dir:
         os.chmod(private_dir, 0o700)
         staged = Path(private_dir) / safe_name
         result = call_mail(

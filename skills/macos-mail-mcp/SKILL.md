@@ -1,11 +1,11 @@
 ---
-name: macos-mail
+name: macos-mail-mcp
 description: Read and manage local Apple Mail.app across configured accounts. Default to Mail's All Inboxes, preserve read state during reads, and verify exact message changes. Use for Mail.app tasks on macOS.
 ---
 
-# macOS Mail
+# macOS Mail MCP
 
-Use the local `macos-mail` MCP server when available. Its tools operate Mail.app through AppleScript. If MCP is not registered in this client, use the bundled CLI at `scripts/macos_mail.py` relative to this skill directory; do not substitute another provider for an explicit Mail.app request.
+Use the local `macos-mail-mcp` MCP server when available. Its tools operate Mail.app through AppleScript. If MCP is not registered in this client, use the bundled CLI at `scripts/macos_mail_mcp.py` relative to this skill directory; do not substitute another provider for an explicit Mail.app request.
 
 ## Scope and reading
 
@@ -32,4 +32,4 @@ Use `mail_prepare` for a new message, reply, or forward. It returns a draft prev
 
 From this installed skill directory, run `python3 scripts/install_mcp.py --client codex` (or `gemini`, `claude`, `all`) to install the stdio MCP runtime and register that client. The installer needs `uv` and Python 3.10+. For Claude Desktop, restart the app after registration. Skill discovery by itself does not register the MCP server.
 
-The bundled CLI remains available without MCP. For example, from the skill directory: `python3 scripts/macos_mail.py recent --unread --limit 3 --body none`. Use `python3 scripts/macos_mail.py --help` for other commands. If macOS denies Automation (`-1743`), authorize the controlling host in System Settings > Privacy & Security > Automation. Use [Apple Mail quirks](references/apple-mail-quirks.md) to diagnose a concrete adapter failure.
+The bundled CLI remains available without MCP. For example, from the skill directory: `python3 scripts/macos_mail_mcp.py recent --unread --limit 3 --body none`. Use `python3 scripts/macos_mail_mcp.py --help` for other commands. If macOS denies Automation (`-1743`), authorize the controlling host in System Settings > Privacy & Security > Automation. Use [Apple Mail quirks](references/apple-mail-quirks.md) to diagnose a concrete adapter failure.

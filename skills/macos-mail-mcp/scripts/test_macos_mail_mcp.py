@@ -233,7 +233,7 @@ class MailCliTests(unittest.TestCase):
             self.assertEqual(Path(result["output_path"]), output.resolve())
             self.assertEqual(output.read_bytes(), b"private attachment")
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
-            self.assertEqual(list(output_dir.glob(".macos-mail-*")), [])
+            self.assertEqual(list(output_dir.glob(".macos-mail-mcp-*")), [])
             with patch.object(mail, "read_message", return_value=message), patch.object(mail, "call_mail") as called:
                 with self.assertRaises(mail.MailCtlError) as existing:
                     mail.cmd_attachment_save(args)

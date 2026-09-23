@@ -37,15 +37,15 @@ class MessageRef(BaseModel):
 
 
 server = MCPServer(
-    name="macos-mail",
-    title="macOS Mail",
+    name="macos-mail-mcp",
+    title="macOS Mail MCP",
     description="Read and manage the local Apple Mail.app across its configured accounts.",
     instructions=(
         "Default to All Inboxes when no account is specified. Read tools preserve unread state. "
         "Use returned message_ref values for changes. Check complete and per-message verification. "
         "Do not retry an uncertain send, permanently delete mail, or empty Trash."
     ),
-    version="0.1.3",
+    version="0.2.0",
 )
 
 
