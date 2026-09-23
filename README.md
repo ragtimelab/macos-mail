@@ -56,7 +56,7 @@ The server communicates only through local stdio. It does not listen on a networ
 python3 skills/macos-mail/scripts/macos_mail.py recent --unread --limit 3 --body none
 ```
 
-Use `--help` for the full CLI. The MCP and CLI share the same Mail adapter and verification logic. On an incomplete cross-account scan, check the returned `complete`, `accounts_scanned`, `accounts_total`, and failures rather than treating a partial result as exhaustive. Sending is intentionally a prepare/send sequence so the draft can be reviewed before transmission. At send time, Mail briefly displays the prepared composer and sends that same object; this lets Mail clear its saved draft through its native send transition.
+Use `--help` for the full CLI. The MCP and CLI share the same Mail adapter and verification logic. On an incomplete cross-account scan, check the returned `complete`, `accounts_scanned`, `accounts_total`, and failures rather than treating a partial result as exhaustive. Sending is intentionally a prepare/send sequence so the draft can be reviewed before transmission. At send time, Mail briefly displays the prepared composer and sends that same object; this lets Mail clear its saved draft through its native send transition. If Mail clears outgoing attachments when showing the composer, the adapter restores the approved files on that same object before sending and verifies them in Sent.
 
 ## Development
 
