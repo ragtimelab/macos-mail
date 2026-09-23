@@ -14,6 +14,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = ROOT / "scripts" / "mcp_server.py"
+RUNTIME_LOCK = ROOT / "requirements-mcp.lock"
+BUILD_LOCK = ROOT / "requirements-build.lock"
 VENV = Path.home() / "Library" / "Application Support" / "macos-mail" / "mcp-venv"
 NAME = "macos-mail"
 
@@ -32,21 +34,23 @@ def ensure_runtime() -> None:
     uv = shutil.which("uv")
     if not uv:
         raise RuntimeError("uv is required to install the MCP runtime; see https://docs.astral.sh/uv/getting-started/installation/")
+    if not RUNTIME_LOCK.is_file() or not BUILD_LOCK.is_file():
+        raise RuntimeError("The bundled MCP dependency locks are missing")
     if not (VENV / "pyvenv.cfg").exists():
         VENV.parent.mkdir(parents=True, exist_ok=True)
         run(uv, "venv", str(VENV), "--python", sys.executable)
-    run(uv, "pip", "install", "--python", python(), "mcp==2.2.0")
+    run(uv, "pip", "sync", "--python", python(), "--require-hashes", "--strict", str(RUNTIME_LOCK))
     try:
         run(python(), "-c", "from mcp.server.mcpserver import MCPServer")
     except subprocess.CalledProcessError as exc:
         if "cryptography" not in exc.stderr and "libssl" not in exc.stderr:
             raise RuntimeError(exc.stderr) from exc
-        # Some third-party Python distributors link a binary wheel to a
-        # different OpenSSL prefix. Build this one dependency against the
-        # active host toolchain rather than modifying global libraries.
-        version = run(python(), "-c", "import importlib.metadata; print(importlib.metadata.version('cryptography'))").stdout.strip()
-        run(uv, "pip", "install", "--python", python(), "--reinstall-package", "cryptography",
-            "--no-binary", "cryptography", "--no-cache", "--index-url", "https://pypi.org/simple", f"cryptography=={version}")
+        # Some Python distributors ship a cryptography wheel linked to a
+        # different OpenSSL prefix. Rebuild only the locked sdist, with locked
+        # build dependencies, against this host's toolchain.
+        run(uv, "pip", "sync", "--python", python(), "--require-hashes", "--strict",
+            "--reinstall-package", "cryptography", "--no-binary", "cryptography",
+            "--no-cache", "--build-constraints", str(BUILD_LOCK), str(RUNTIME_LOCK))
         run(python(), "-c", "from mcp.server.mcpserver import MCPServer")
     print(f"MCP runtime ready: {python()}")
 

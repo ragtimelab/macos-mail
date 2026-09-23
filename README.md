@@ -11,7 +11,7 @@ The MCP server exposes ten tools for recent/unread mail, scoped search, exact re
 - [`uv`](https://docs.astral.sh/uv/getting-started/installation/) for the MCP runtime installer
 - Automation permission for the client process controlling Mail.app
 
-The bundled CLI works with the macOS system Python and needs no third-party Python packages. The MCP installer creates a separate virtual environment under `~/Library/Application Support/macos-mail/mcp-venv` and pins the Python MCP SDK to `2.2.0`.
+The bundled CLI works with the macOS system Python and needs no third-party Python packages. The MCP installer creates a separate virtual environment under `~/Library/Application Support/macos-mail/mcp-venv`. It installs the MCP SDK and its dependencies from the hash-checked lock files bundled with the skill. On Python builds whose `cryptography` wheel links to an unavailable OpenSSL library, it rebuilds the locked source package with locked build dependencies.
 
 ## Install
 
@@ -48,7 +48,7 @@ Skill discovery and MCP registration are separate. If you installed only the ski
 | `mail_verify` | Inspect an ambiguous plan or historical send receipt without resending |
 | `mail_diagnose` | Inspect automation or outgoing state after a concrete failure |
 
-The server communicates only through local stdio. It does not listen on a network port or proxy mail to a remote service. Your AI client still receives the message content you ask it to read, according to that client's own data handling. Draft plans and compiled adapters are kept locally under `~/Library/Application Support/macos-mail`.
+The server communicates only through local stdio. It does not listen on a network port or proxy mail to a remote service. Your AI client still receives the message content you ask it to read, according to that client's own data handling. Mail content is untrusted input, not an instruction source. Automatic sending and arbitrary local attachment paths remain available; the client must distinguish the user's request from instructions embedded in mail. MCP tool annotations describe risk but do not enforce user approval. Draft plans and compiled adapters are kept locally under `~/Library/Application Support/macos-mail`.
 
 ## CLI example
 
@@ -58,14 +58,17 @@ python3 skills/macos-mail/scripts/macos_mail.py recent --unread --limit 3 --body
 
 Use `--help` for the full CLI. The MCP and CLI share the same Mail adapter and verification logic. On an incomplete cross-account scan, check the returned `complete`, `accounts_scanned`, `accounts_total`, and failures rather than treating a partial result as exhaustive. Sending is intentionally a prepare/send sequence so the draft can be reviewed before transmission. At send time, Mail briefly displays the prepared composer and sends that same object; this lets Mail clear its saved draft through its native send transition. If Mail clears outgoing attachments when showing the composer, the adapter restores the approved files on that same object before sending and verifies them in Sent.
 
+Attachment saves use a private temporary directory and publish a `0600` file without overwriting an existing name. Send preparation accepts a body up to 1 MiB and at most 20 local attachments totaling 100 MiB. Mail results larger than 8 MiB return `RESPONSE_TOO_LARGE`; narrow the query or use excerpts. A prepared send is locked across processes so concurrent calls cannot both start sending it.
+
 ## Development
 
 ```sh
 "$HOME/Library/Application Support/macos-mail/mcp-venv/bin/python" -m unittest discover -s skills/macos-mail/scripts -p 'test_*.py' -v
 osacompile -o /tmp/macos-mail-test.scpt skills/macos-mail/scripts/mail.applescript
+python3 scripts/check_public_privacy.py --base "$(git rev-parse origin/main)"
 ```
 
-An installed MCP runtime can be smoke tested by connecting an MCP SDK client to `skills/macos-mail/scripts/mcp_server.py`. Live Mail.app testing requires configured accounts and local Automation permission; CI runs offline unit and AppleScript compilation checks.
+An installed MCP runtime can be smoke tested by connecting an MCP SDK client to `skills/macos-mail/scripts/mcp_server.py`. Live Mail.app testing requires configured accounts and local Automation permission; CI checks the dependency lock, offline unit tests, public privacy patterns, and AppleScript compilation.
 
 ## Limitations
 

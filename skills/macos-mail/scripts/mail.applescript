@@ -362,7 +362,8 @@ using terms from application "Mail"
                 set aMessage to item 1 of matches
                 if expectedUniversalID is not "" then
                     if not my messageMatchesUniversalID(aMessage, expectedUniversalID) then error "Universal message identifier mismatch" number 9111
-                else if expectedRFCID is not "" then
+                end if
+                if expectedRFCID is not "" then
                     try
                         if ((get message id of aMessage) as text) is not expectedRFCID then error "RFC Message-ID mismatch" number 9107
                     on error errorMessage number errorNumber
@@ -386,7 +387,7 @@ using terms from application "Mail"
                 if (count of matches) > 1 then error "RFC Message-ID matched more than one " & contextText number 9112
             end if
 
-            if expectedUniversalID is not "" then
+            if expectedUniversalID is not "" and expectedRFCID is "" then
                 set universalMatches to {}
                 repeat with candidateMessage in every message of aMailbox
                     if my messageMatchesUniversalID(candidateMessage, expectedUniversalID) then set end of universalMatches to candidateMessage
@@ -411,6 +412,9 @@ using terms from application "Mail"
     on findRoleMessage(roleName, referenceObject)
         set {accountQuery, referencePath, localID, expectedRFCID, expectedUniversalID} to my refParts(referenceObject)
         set anAccount to my resolveAccount(accountQuery)
+        -- Saved drafts can receive a new RFC Message-ID during Mail sync. Their
+        -- universal ID, envelope and bound outgoing object are checked on send.
+        if roleName is "drafts" and expectedUniversalID is not "" then set expectedRFCID to ""
         if roleName is "drafts" and (count of referencePath) > 0 then
             set aRoleMailbox to my resolveMailbox(anAccount, referencePath)
         else

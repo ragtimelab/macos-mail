@@ -5,15 +5,29 @@ on:
 jobs:
   test:
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.13', '3.14']
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
-      - name: Install MCP SDK
-        run: python3 -m pip install 'mcp==2.2.0'
+          python-version: ${{ matrix.python-version }}
+      - name: Install locked MCP runtime
+        run: |
+          python3 -m pip install 'uv==0.12.18'
+          uv venv .venv --python "$(command -v python3)"
+          uv pip sync --python .venv/bin/python --require-hashes --strict skills/macos-mail/requirements-mcp.lock
+          .venv/bin/python -c 'from mcp.server.mcpserver import MCPServer'
       - name: Python unit tests
-        run: python3 -m unittest discover -s skills/macos-mail/scripts -p 'test_*.py' -v
+        run: .venv/bin/python -m unittest discover -s skills/macos-mail/scripts -p 'test_*.py' -v
+      - name: Public privacy check
+        env:
+          PRIVACY_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python3 scripts/check_public_privacy.py --base "$PRIVACY_BASE_SHA"
       - name: Compile AppleScript
         run: osacompile -o /tmp/macos-mail-ci.scpt skills/macos-mail/scripts/mail.applescript
       - name: Check Python syntax
