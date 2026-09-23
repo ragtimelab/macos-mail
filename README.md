@@ -20,7 +20,7 @@ Clone this repository to a **stable path**. For example:
 ```sh
 git clone https://github.com/ragtimelab/macos-mail.git ~/Coding/macos-mail
 cd ~/Coding/macos-mail
-python3 scripts/install_mcp.py --client codex
+python3 skills/macos-mail/scripts/install_mcp.py --client codex
 ```
 
 Choose `gemini`, `claude`, or `all` instead of `codex` to register other supported clients. Run the installer again after changing the checkout path. It leaves an existing, different server registration untouched and asks you to inspect it. Claude Desktop requires an app restart after registration. Registration makes MCP tools available to that client; an actual model tool call may also depend on the client's account and permissions.
@@ -31,7 +31,7 @@ Install just the agent skill through [skills.sh](https://skills.sh/):
 npx skills add ragtimelab/macos-mail --skill macos-mail
 ```
 
-Skill discovery and MCP registration are separate. If the MCP server is unavailable, the skill can use its bundled CLI directly. A skill installed at another location can run `python3 scripts/macos_mail.py` from its own directory.
+Skill discovery and MCP registration are separate. If you installed only the skill, run `python3 scripts/install_mcp.py --client codex` from that installed skill directory. The MCP server and CLI are bundled in the skill; they can run from any stable skill installation path. If MCP is unavailable, the skill can use its CLI directly.
 
 ## What the tools do
 

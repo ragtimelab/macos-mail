@@ -27,6 +27,6 @@ Use `mail_prepare` for a new message, reply, or forward. It returns a draft prev
 
 ## Setup and fallback
 
-From a stable checkout of this repository, run `python3 scripts/install_mcp.py --client codex` (or `gemini`, `claude`, `all`) to install the stdio MCP runtime and register that client. The installer needs `uv` and Python 3.10+. For Claude Desktop, restart the app after registration. Skill discovery by itself does not register the MCP server.
+From this installed skill directory, run `python3 scripts/install_mcp.py --client codex` (or `gemini`, `claude`, `all`) to install the stdio MCP runtime and register that client. The installer needs `uv` and Python 3.10+. For Claude Desktop, restart the app after registration. Skill discovery by itself does not register the MCP server.
 
 The bundled CLI remains available without MCP. For example, from the skill directory: `python3 scripts/macos_mail.py recent --unread --limit 3 --body none`. Use `python3 scripts/macos_mail.py --help` for other commands. If macOS denies Automation (`-1743`), authorize the controlling host in System Settings > Privacy & Security > Automation. Use [Apple Mail quirks](references/apple-mail-quirks.md) to diagnose a concrete adapter failure.

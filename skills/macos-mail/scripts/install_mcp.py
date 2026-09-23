@@ -13,7 +13,7 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SERVER = ROOT / "skills" / "macos-mail" / "scripts" / "mcp_server.py"
+SERVER = ROOT / "scripts" / "mcp_server.py"
 VENV = Path.home() / "Library" / "Application Support" / "macos-mail" / "mcp-venv"
 NAME = "macos-mail"
 
