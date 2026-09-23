@@ -1,0 +1,4 @@
+interface:
+  display_name: "macOS Mail"
+  short_description: "Mail 앱의 전체 받은 편지함 조회와 정확한 메시지 변경"
+  default_prompt: "Use $macos-mail to read the requested Mail.app accounts and make exact, verified changes to the messages the user specified."

@@ -1,0 +1,20 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install MCP SDK
+        run: python3 -m pip install 'mcp==2.2.0'
+      - name: Python unit tests
+        run: python3 -m unittest discover -s skills/macos-mail/scripts -p 'test_*.py' -v
+      - name: Compile AppleScript
+        run: osacompile -o /tmp/macos-mail-ci.scpt skills/macos-mail/scripts/mail.applescript
+      - name: Check Python syntax
+        run: python3 -m compileall -q scripts skills/macos-mail/scripts
