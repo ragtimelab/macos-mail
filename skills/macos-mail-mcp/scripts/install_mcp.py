@@ -16,8 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SERVER = ROOT / "scripts" / "mcp_server.py"
 RUNTIME_LOCK = ROOT / "requirements-mcp.lock"
 BUILD_LOCK = ROOT / "requirements-build.lock"
-VENV = Path.home() / "Library" / "Application Support" / "macos-mail" / "mcp-venv"
-NAME = "macos-mail"
+VENV = Path.home() / "Library" / "Application Support" / "macos-mail-mcp" / "mcp-venv"
+NAME = "macos-mail-mcp"
 
 
 def run(*argv: str) -> subprocess.CompletedProcess[str]:
@@ -65,7 +65,7 @@ def register_codex() -> None:
         if config.get("type") == "stdio" and config.get("command") == python() and config.get("args") == [str(SERVER)]:
             print("Codex registration already matches")
             return
-        raise RuntimeError("Codex already has a different macos-mail server; inspect `codex mcp get macos-mail --json`")
+        raise RuntimeError("Codex already has a different macos-mail-mcp server; inspect `codex mcp get macos-mail-mcp --json`")
     run(codex, "mcp", "add", NAME, "--", python(), str(SERVER))
     print("Codex registered")
 
@@ -81,7 +81,7 @@ def register_gemini() -> None:
         if existing.get("command") == python() and existing.get("args") == [str(SERVER)]:
             print("Gemini registration already matches")
             return
-        raise RuntimeError("Gemini already has a different macos-mail server; inspect ~/.gemini/settings.json")
+        raise RuntimeError("Gemini already has a different macos-mail-mcp server; inspect ~/.gemini/settings.json")
     run(gemini, "mcp", "add", "--scope", "user", NAME, python(), str(SERVER))
     print("Gemini registered")
 
