@@ -1571,6 +1571,9 @@ using terms from application "Mail"
         -- Sending this object while hidden left the draft in Gmail Drafts.
         tell application "Mail"
             set visible of outgoingMessage to true
+            set visibleAttachmentCount to count of attachments of content of outgoingMessage
+            if visibleAttachmentCount is 0 and (count of attachmentPaths) > 0 then my addAttachments(outgoingMessage, attachmentPaths)
+            if (count of attachments of content of outgoingMessage) is not (count of attachmentPaths) then error "Prepared outgoing attachments changed" number 9223
             set sendAccepted to send outgoingMessage
             if not sendAccepted then error "Mail did not accept the outgoing message" number 9210
             set sentMessage to missing value

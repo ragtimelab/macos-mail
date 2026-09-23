@@ -45,7 +45,7 @@ server = MCPServer(
         "Use returned message_ref values for changes. Check complete and per-message verification. "
         "Do not retry an uncertain send, permanently delete mail, or empty Trash."
     ),
-    version="0.1.1",
+    version="0.1.2",
 )
 
 
