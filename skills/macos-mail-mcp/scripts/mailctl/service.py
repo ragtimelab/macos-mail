@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 from contextlib import contextmanager
 import datetime as dt
 import fcntl
@@ -50,7 +52,7 @@ MINIMUM_SEND_TIMEOUT = (
 if SEND_TIMEOUT < MINIMUM_SEND_TIMEOUT:
     raise RuntimeError("send_timeout_seconds is smaller than the configured preflight and verification budget")
 
-LOCATE_DEFAULT_WINDOW_SECONDS = 14 * 24 * 60 * 60
+FIND_FIRST_WINDOW_SECONDS = 30 * 24 * 60 * 60
 MAX_BODY_BYTES = 1024 * 1024
 MAX_ATTACHMENTS = 20
 MAX_ATTACHMENT_TOTAL_BYTES = 100 * 1024 * 1024
@@ -434,12 +436,25 @@ def cmd_accounts(_: argparse.Namespace) -> dict[str, Any]:
 
 
 def cmd_recent(args: argparse.Namespace) -> dict[str, Any]:
+    requested_body = args.body
+    if requested_body not in ("auto", "none", "excerpt", "full"):
+        raise MailCtlError("INVALID_BODY_MODE", "Use auto, none, excerpt, or full")
+    if args.limit > 3 and requested_body in ("excerpt", "full"):
+        raise MailCtlError("BODY_LIMIT", "Read at most 3 bodies with mail_recent; use metadata results and mail_read for more")
+    effective_body = ("none" if (args.subject and args.subject.strip()) or args.limit > 3 else "excerpt") if requested_body == "auto" else requested_body
+    def annotate(result: dict[str, Any]) -> dict[str, Any]:
+        result["body_mode_requested"] = requested_body
+        result["body_mode_effective"] = effective_body
+        result["body_deferred"] = requested_body == "auto" and effective_body == "none"
+        if effective_body == "none":
+            result["messages"] = [compact_inbox_message(item) for item in result.get("messages", [])]
+        return result
     try:
-        return call_mail(
+        return annotate(call_mail(
             "recent",
             {
                 "limit": args.limit,
-                "body_mode": args.body,
+                "body_mode": effective_body,
                 "unread": bool(args.unread),
                 "sender": args.sender or "",
                 "subject": args.subject or "",
@@ -447,11 +462,11 @@ def cmd_recent(args: argparse.Namespace) -> dict[str, Any]:
                 "before_epoch_seconds": parse_iso_epoch(args.before),
             },
             timeout=args.timeout,
-        )
+        ))
     except MailCtlError as exc:
         if isinstance(exc.details, dict) and exc.details.get("operation") == "recent" and exc.details.get("complete") is False:
-            return exc.details
-        return {"ok": False, "operation": "recent", "scope": "all-inboxes", "complete": False, "code": exc.code, "error": exc.message, "details": exc.details}
+            return annotate(exc.details)
+        return annotate({"ok": False, "operation": "recent", "scope": "all-inboxes", "complete": False, "code": exc.code, "error": exc.message, "details": exc.details})
 
 
 def load_action_refs(path_text: str) -> list[dict[str, Any]]:
@@ -562,31 +577,125 @@ def locator_identity(value: str) -> str:
     return compact
 
 
-def cmd_locate(args: argparse.Namespace) -> dict[str, Any]:
-    """Find a recent sender across account INBOX folders in one read-only Mail call."""
-    sender_identity = locator_identity(args.sender)
-    since_epoch = parse_iso_epoch(args.since) if args.since else int(time.time()) - LOCATE_DEFAULT_WINDOW_SECONDS
-    before_epoch = parse_iso_epoch(args.before)
+def compact_inbox_message(item: dict[str, Any]) -> dict[str, Any]:
+    ref = {key: value for key, value in item.get("message_ref", {}).items()
+           if key in ("account", "mailbox_path", "local_id", "rfc_message_id", "universal_id")
+           and (value != "" or key in ("account", "mailbox_path", "local_id"))}
+    return {key: value for key, value in {
+        "message_ref": ref,
+        "sender": item.get("sender"),
+        "subject": item.get("subject"),
+        "date_received_iso": item.get("date_received_iso"),
+        "read": item.get("read"),
+    }.items() if value is not None}
+
+
+def _find_fingerprint(sender: str, subject: str, since_epoch: int | None, before_epoch: int | None,
+                      unread: bool, limit: int) -> str:
+    return canonical_hash({"sender": sender, "subject": subject, "since": since_epoch,
+                           "before": before_epoch, "unread": unread, "limit": limit})
+
+
+def _decode_find_cursor(token: str, fingerprint: str) -> tuple[int, str, int]:
+    if len(token) > 2048:
+        raise MailCtlError("INVALID_PAGE_TOKEN", "Page token is too long")
     try:
-        return call_mail(
-            "locate",
-            {
-                "sender_identity": sender_identity,
-                "subject": args.subject or "",
-                "since_epoch_seconds": since_epoch,
-                "before_epoch_seconds": before_epoch,
-                "limit": args.limit,
-                "read_if_unique": bool(args.read_if_unique),
-                "body_mode": args.body,
-                "include_headers": bool(args.include_headers),
-                "include_source": bool(args.include_source),
-            },
-            timeout=args.timeout,
-        )
-    except MailCtlError as exc:
-        if isinstance(exc.details, dict) and exc.details.get("operation") == "locate" and exc.details.get("complete") is False:
-            return exc.details
-        raise
+        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+        value = json.loads(raw)
+        if (not isinstance(value, dict) or value.get("v") != 1 or value.get("q") != fingerprint
+                or type(value.get("d")) is not int or not 0 <= value["d"] <= 253402300799
+                or not isinstance(value.get("a"), str) or not value["a"] or len(value["a"]) > 256
+                or type(value.get("l")) is not int or not 1 <= value["l"] <= 9223372036854775807):
+            raise ValueError("invalid cursor fields")
+        return value["d"], value["a"], value["l"]
+    except (ValueError, TypeError, KeyError, UnicodeError, binascii.Error) as exc:
+        raise MailCtlError("INVALID_PAGE_TOKEN", "Page token does not match this search") from exc
+
+
+def _encode_find_cursor(message: dict[str, Any], fingerprint: str) -> str:
+    received = dt.datetime.fromisoformat(message["date_received_iso"])
+    value = {"v": 1, "q": fingerprint, "d": int(received.timestamp()),
+             "a": message["account_id"], "l": message["message_ref"]["local_id"]}
+    return base64.urlsafe_b64encode(json.dumps(value, separators=(",", ":")).encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def cmd_locate(args: argparse.Namespace) -> dict[str, Any]:
+    """Page through sender or subject matches across all account Inboxes."""
+    subject = (args.subject or "").strip()
+    sender_identity = locator_identity(args.sender) if args.sender and args.sender.strip() else ""
+    if not sender_identity and not subject:
+        raise MailCtlError("LOCATOR_FILTER_REQUIRED", "Provide a sender or subject for cross-account INBOX lookup")
+    if not 1 <= args.limit <= POLICY["search_limit_max"]:
+        raise MailCtlError("INVALID_LIMIT", "Limit must be between 1 and 200")
+    include_total = bool(getattr(args, "include_total", False))
+    page_token = getattr(args, "page_token", None)
+    if page_token and (include_total or args.read_if_unique):
+        raise MailCtlError("INVALID_PAGE_TOKEN", "Total count and unique reads require the first page")
+    since_epoch = parse_iso_epoch(args.since)
+    before_epoch = parse_iso_epoch(args.before)
+    fingerprint = _find_fingerprint(sender_identity, subject, since_epoch, before_epoch, bool(args.unread), args.limit)
+    cursor = _decode_find_cursor(page_token, fingerprint) if page_token else None
+    scan_before = min(before_epoch, cursor[0] + 1) if cursor and before_epoch is not None else (cursor[0] + 1 if cursor else before_epoch)
+    scan_limit = min(args.limit + 1, POLICY["search_limit_max"] + 1)
+
+    def scan(window_since: int | None) -> dict[str, Any]:
+        try:
+            return call_mail(
+                "locate",
+                {
+                    "sender_identity": sender_identity,
+                    "subject": subject,
+                    "since_epoch_seconds": window_since,
+                    "before_epoch_seconds": scan_before,
+                    "unread": bool(args.unread),
+                    "cursor_epoch_seconds": cursor[0] if cursor else None,
+                    "cursor_account_id": cursor[1] if cursor else "",
+                    "cursor_local_id": cursor[2] if cursor else 0,
+                    "limit": scan_limit,
+                    "read_if_unique": bool(args.read_if_unique),
+                    "body_mode": args.body,
+                    "include_headers": bool(args.include_headers),
+                    "include_source": bool(args.include_source),
+                },
+                timeout=args.timeout,
+            )
+        except MailCtlError as exc:
+            if isinstance(exc.details, dict) and exc.details.get("operation") == "locate" and exc.details.get("complete") is False:
+                return exc.details
+            return {"ok": False, "operation": "locate", "scope": "all-inboxes", "complete": False,
+                    "code": exc.code, "error": exc.message, "details": exc.details, "messages": []}
+
+    anchor = cursor[0] if cursor else (before_epoch if before_epoch is not None else int(time.time()))
+    window_since = max(since_epoch, anchor - FIND_FIRST_WINDOW_SECONDS) if since_epoch is not None else anchor - FIND_FIRST_WINDOW_SECONDS
+    # A specific subject is usually cheaper as one Mail query than a recent-window miss
+    # followed by the same full-history query. Short, broad subjects can stop early.
+    specific_subject = bool(subject) and (len(subject) >= 8 or bool(sender_identity))
+    full_window = (include_total or bool(args.read_if_unique) or specific_subject
+                   or (since_epoch is not None and since_epoch >= window_since))
+    result = scan(since_epoch if full_window else window_since)
+    if not full_window and result.get("complete") and result.get("match_total", 0) <= args.limit:
+        result = scan(since_epoch)
+        full_window = True
+
+    messages = result.get("messages", [])
+    complete = result.get("complete") is True
+    has_more = (result.get("match_total", 0) > args.limit) if complete else None
+    selected = messages[:args.limit]
+    if not result.get("unique_read"):
+        result["messages"] = [compact_inbox_message(item) for item in selected]
+        result["count"] = len(selected)
+    result["has_more"] = has_more
+    result["next_page_token"] = _encode_find_cursor(selected[-1], fingerprint) if has_more and selected else None
+    result["history_exhausted"] = complete and full_window and not has_more
+    if not full_window or not complete:
+        result.pop("match_total", None)
+    if not complete:
+        result["next_page_token"] = None
+    unique_body = bool(result.get("unique_read"))
+    result["body_mode_requested"] = args.body
+    result["body_mode_effective"] = args.body if unique_body else "none"
+    result["body_deferred"] = not unique_body and args.body != "none"
+    return result
 
 
 def cmd_inspect(args: argparse.Namespace) -> dict[str, Any]:
@@ -887,7 +996,7 @@ def build_parser() -> argparse.ArgumentParser:
     recent.add_argument("--since", help="ISO-8601 inclusive start")
     recent.add_argument("--before", help="ISO-8601 exclusive end")
     recent.add_argument("--limit", type=int, default=3, choices=range(1, POLICY["search_limit_max"] + 1))
-    recent.add_argument("--body", choices=["none", "excerpt", "full"], default="excerpt")
+    recent.add_argument("--body", choices=["auto", "none", "excerpt", "full"], default="auto")
     recent.add_argument("--timeout", type=int, default=120)
     recent.set_defaults(func=cmd_recent)
 
@@ -926,15 +1035,18 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--body", choices=["none", "excerpt", "full"], default="excerpt")
     search.set_defaults(func=cmd_search)
 
-    locate = sub.add_parser("locate", help="Fast, read-only recent-INBOX lookup across local Mail accounts")
-    locate.add_argument("--sender", required=True, help="Exact sender address or at least two display-name tokens")
+    locate = sub.add_parser("locate", help="Sender or subject lookup across all account Inboxes")
+    locate.add_argument("--sender", help="Exact sender address or at least two display-name tokens")
     locate.add_argument("--subject")
-    locate.add_argument("--since", help="ISO-8601 start; defaults to the last 14 days")
+    locate.add_argument("--since", help="ISO-8601 inclusive start; omitted means full Inbox history")
     locate.add_argument("--before", help="ISO-8601 exclusive end")
+    locate.add_argument("--unread", action="store_true")
+    locate.add_argument("--page-token", help="Opaque cursor returned by an earlier locate page")
+    locate.add_argument("--include-total", action="store_true", help="Scan the full search range for an exact count")
     locate.add_argument(
         "--limit",
         type=int,
-        default=POLICY["search_limit_default"],
+        default=20,
         choices=range(1, POLICY["search_limit_max"] + 1),
         metavar=f"1..{POLICY['search_limit_max']}",
     )

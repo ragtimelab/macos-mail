@@ -52,7 +52,7 @@ server = MCPServer(
         "Use returned message_ref values for changes. Check complete and per-message verification. "
         "Do not retry an uncertain send, permanently delete mail, or empty Trash."
     ),
-    version="0.3.0",
+    version="0.4.0",
 )
 
 
@@ -201,13 +201,13 @@ def _execute_bound_send(token: str) -> dict[str, Any]:
 async def mail_recent(
     unread: bool = False,
     limit: int = Field(default=3, ge=1, le=200),
-    body: Literal["none", "excerpt", "full"] = "excerpt",
+    body: Literal["auto", "none", "excerpt", "full"] = "auto",
     sender: str | None = None,
     subject: str | None = None,
     since: str | None = None,
     before: str | None = None,
 ) -> dict[str, Any]:
-    """Newest messages across Mail.app's actual All Inboxes; report incomplete scans."""
+    """Newest messages across All Inboxes. Auto reads up to 3 excerpts; subject filters or larger lists return metadata. Use mail_read for selected bodies."""
     args = argparse.Namespace(unread=unread, limit=limit, body=body, sender=sender, subject=subject,
                               since=since, before=before, timeout=120)
     return await _call(service.cmd_recent, args)
@@ -226,24 +226,30 @@ async def mail_find(
     unread: bool = False,
     read_if_unique: bool = False,
     body: Literal["none", "excerpt", "full"] = "excerpt",
-    limit: int = Field(default=50, ge=1, le=200),
+    limit: int | None = Field(default=None, ge=1, le=200),
+    page_token: str | None = None,
+    include_total: bool = False,
     include_headers: bool = False,
     include_source: bool = False,
 ) -> dict[str, Any]:
-    """Find mail across All Inboxes or one mailbox. read_if_unique marks a unique result as read."""
+    """Find sender or subject across All Inboxes with 20-result pages, or inspect one mailbox. No implicit date cutoff. Follow next_page_token; include_total is slower. read_if_unique fetches one unique body without changing read status."""
     if scope == "all_inboxes":
-        if not sender or account or mailbox_path or recipient or unread:
-            return {"ok": False, "code": "INVALID_SCOPE", "error": "All Inboxes find requires sender and does not accept account, mailbox, recipient or unread"}
+        if account or mailbox_path or recipient or not ((sender or "").strip() or (subject or "").strip()):
+            return {"ok": False, "code": "INVALID_SCOPE", "error": "All Inboxes find requires sender or subject and does not accept account, mailbox or recipient"}
         args = argparse.Namespace(sender=sender, subject=subject, since=since, before=before,
-                                  read_if_unique=read_if_unique, body=body, limit=limit,
+                                  unread=unread, read_if_unique=read_if_unique, body=body, limit=20 if limit is None else limit,
+                                  page_token=page_token, include_total=include_total,
                                   include_headers=include_headers, include_source=include_source, timeout=120)
         return await _call(service.cmd_locate, args)
+    if page_token or include_total:
+        return {"ok": False, "code": "INVALID_SCOPE", "error": "Pagination and total count apply only to All Inboxes find"}
     if not account or not mailbox_path or any(not item for item in mailbox_path):
         return {"ok": False, "code": "INVALID_SCOPE", "error": "Mailbox find requires account and mailbox_path"}
     args = argparse.Namespace(account=account, mailbox_json=json.dumps(mailbox_path, ensure_ascii=False),
                               mailbox=None, sender=sender, subject=subject, recipient=recipient,
                               since=since, before=before, unread=unread, read_if_unique=read_if_unique,
-                              body=body, limit=limit, include_headers=include_headers,
+                              body=body, limit=service.POLICY["search_limit_default"] if limit is None else limit,
+                              include_headers=include_headers,
                               include_source=include_source, timeout=120)
     return await _call(service.cmd_inspect, args)
 

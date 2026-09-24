@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import mcp_server
-from mcp_server import MessageRef, mail_change, mail_prepare, mail_recent, mail_send, mail_verify
+from mcp_server import MessageRef, mail_change, mail_find, mail_prepare, mail_recent, mail_send, mail_verify
 from mailctl import service
 
 
@@ -30,6 +30,26 @@ class MCPBoundaryTests(unittest.IsolatedAsyncioTestCase):
             result = await mail_recent(unread=True, limit=3, body="none", sender=None, subject=None, since=None, before=None)
         self.assertEqual(result["scope"], "all-inboxes")
         self.assertTrue(called.call_args.args[0].unread)
+
+    async def test_all_inboxes_find_accepts_subject_and_page_options(self) -> None:
+        with patch.object(service, "cmd_locate", return_value={"ok": True, "scope": "all-inboxes"}) as called:
+            result = await mail_find(scope="all_inboxes", subject="PR", unread=True, limit=20, page_token=None,
+                                     include_total=False)
+        self.assertEqual(result["scope"], "all-inboxes")
+        self.assertEqual(called.call_args.args[0].subject, "PR")
+        self.assertTrue(called.call_args.args[0].unread)
+        with patch.object(service, "cmd_locate") as never_called:
+            invalid = await mail_find(scope="all_inboxes", sender=None, subject=" ")
+        self.assertEqual(invalid["code"], "INVALID_SCOPE")
+        never_called.assert_not_called()
+
+    async def test_find_defaults_preserve_mailbox_limit(self) -> None:
+        with patch.object(service, "cmd_locate", return_value={"ok": True}) as all_inboxes:
+            await mail_find(scope="all_inboxes", subject="PR", limit=None)
+        self.assertEqual(all_inboxes.call_args.args[0].limit, 20)
+        with patch.object(service, "cmd_inspect", return_value={"ok": True}) as mailbox:
+            await mail_find(scope="mailbox", account="Example", mailbox_path=["INBOX"], subject="PR", limit=None)
+        self.assertEqual(mailbox.call_args.args[0].limit, service.POLICY["search_limit_default"])
 
     async def test_batch_change_passes_exact_refs_once(self) -> None:
         with patch.object(service, "act_messages", return_value={"ok": True, "complete": True}) as called:

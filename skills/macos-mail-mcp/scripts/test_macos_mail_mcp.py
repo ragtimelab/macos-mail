@@ -28,6 +28,10 @@ def ref(local_id: int = 17) -> dict:
 
 
 class MailCliTests(unittest.TestCase):
+    def _find_message(self, local_id: int = 17) -> dict:
+        return {"message_ref": ref(local_id), "account_id": "account-1", "sender": "Sender",
+                "subject": "PR update", "read": False, "date_received_iso": "2026-09-20T10:00:00+09:00"}
+
     def test_cli_exposes_read_and_change_but_no_multistep_send(self) -> None:
         parser = mail.build_parser()
         self.assertIs(parser.parse_args(["recent", "--unread", "--limit", "3", "--body", "full"]).func, mail.cmd_recent)
@@ -73,6 +77,88 @@ class MailCliTests(unittest.TestCase):
         with patch.object(mail, "call_mail", return_value={"ok": True, "complete": True, "messages": []}) as called:
             mail.cmd_recent(args)
         self.assertGreater(called.call_args.args[1]["since_epoch_seconds"], 0)
+
+    def test_recent_auto_uses_metadata_for_large_or_subject_lists(self) -> None:
+        for options in (["--limit", "20"], ["--subject", "PR"]):
+            args = mail.build_parser().parse_args(["recent", *options])
+            with patch.object(mail, "call_mail", return_value={"ok": True, "complete": True,
+                    "messages": [self._find_message()]}) as called:
+                result = mail.cmd_recent(args)
+            self.assertEqual(called.call_args.args[1]["body_mode"], "none")
+            self.assertEqual(result["body_mode_effective"], "none")
+            self.assertEqual(set(result["messages"][0]), {"message_ref", "sender", "subject", "read", "date_received_iso"})
+        args = mail.build_parser().parse_args(["recent", "--limit", "20", "--body", "full"])
+        with patch.object(mail, "call_mail") as called, self.assertRaises(mail.MailCtlError) as raised:
+            mail.cmd_recent(args)
+        self.assertEqual(raised.exception.code, "BODY_LIMIT")
+        called.assert_not_called()
+
+    def test_subject_find_pages_without_implicit_date_limit(self) -> None:
+        args = mail.build_parser().parse_args(["locate", "--subject", "PR", "--limit", "1", "--body", "none"])
+        response = {"ok": True, "complete": True, "match_total": 2, "messages": [self._find_message(17), self._find_message(18)]}
+        with patch.object(mail, "call_mail", return_value=response) as called:
+            result = mail.cmd_locate(args)
+        self.assertEqual(called.call_count, 1)
+        self.assertIsNotNone(called.call_args.args[1]["since_epoch_seconds"])
+        self.assertEqual(result["count"], 1)
+        self.assertTrue(result["has_more"])
+        self.assertNotIn("match_total", result)
+        self.assertNotIn("account_id", result["messages"][0])
+        args.page_token = result["next_page_token"]
+        with patch.object(mail, "call_mail", return_value={"ok": True, "complete": True, "match_total": 0, "messages": []}) as next_page:
+            mail.cmd_locate(args)
+        self.assertEqual(next_page.call_args.args[1]["cursor_local_id"], 17)
+        args.subject = "different"
+        with patch.object(mail, "call_mail") as never_called, self.assertRaises(mail.MailCtlError) as raised:
+            mail.cmd_locate(args)
+        self.assertEqual(raised.exception.code, "INVALID_PAGE_TOKEN")
+        never_called.assert_not_called()
+
+    def test_find_underfilled_window_rechecks_full_history(self) -> None:
+        args = mail.build_parser().parse_args(["locate", "--sender", "news@example.test", "--limit", "20", "--body", "none"])
+        first = {"ok": True, "complete": True, "match_total": 0, "messages": []}
+        second = {"ok": True, "complete": True, "match_total": 1, "messages": [self._find_message()]}
+        with patch.object(mail, "call_mail", side_effect=[first, second]) as called:
+            result = mail.cmd_locate(args)
+        self.assertEqual(called.call_count, 2)
+        self.assertIsNone(called.call_args.args[1]["since_epoch_seconds"])
+        self.assertEqual(result["match_total"], 1)
+        self.assertTrue(result["history_exhausted"])
+        self.assertFalse(result["has_more"])
+
+    def test_specific_subject_scans_full_history_once(self) -> None:
+        args = mail.build_parser().parse_args(["locate", "--subject", "Supabase", "--body", "none"])
+        with patch.object(mail, "call_mail", return_value={"ok": True, "complete": True,
+                "match_total": 1, "messages": [self._find_message()]}) as called:
+            result = mail.cmd_locate(args)
+        called.assert_called_once()
+        self.assertIsNone(called.call_args.args[1]["since_epoch_seconds"])
+        self.assertEqual(result["count"], 1)
+
+    def test_find_exact_total_and_partial_coverage(self) -> None:
+        args = mail.build_parser().parse_args(["locate", "--subject", "PR", "--include-total", "--body", "none"])
+        complete = {"ok": True, "complete": True, "match_total": 21, "messages": [self._find_message()]}
+        with patch.object(mail, "call_mail", return_value=complete) as called:
+            result = mail.cmd_locate(args)
+        self.assertIsNone(called.call_args.args[1]["since_epoch_seconds"])
+        self.assertEqual(result["match_total"], 21)
+        args.include_total = False
+        partial = {"ok": False, "complete": False, "match_verified_count": 1, "messages": [self._find_message()],
+                   "failures": [{"account": "Other"}]}
+        with patch.object(mail, "call_mail", return_value=partial):
+            result = mail.cmd_locate(args)
+        self.assertIsNone(result["has_more"])
+        self.assertIsNone(result["next_page_token"])
+        self.assertNotIn("match_total", result)
+
+    def test_find_timeout_reports_incomplete_without_retrying(self) -> None:
+        args = mail.build_parser().parse_args(["locate", "--subject", "PR", "--body", "none"])
+        with patch.object(mail, "call_mail", side_effect=mail.MailCtlError("TIMEOUT", "Mail was slow")) as called:
+            result = mail.cmd_locate(args)
+        called.assert_called_once()
+        self.assertFalse(result["complete"])
+        self.assertIsNone(result["has_more"])
+        self.assertEqual(result["code"], "TIMEOUT")
 
     def test_refs_file_rejects_duplicate_and_invalid_targets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

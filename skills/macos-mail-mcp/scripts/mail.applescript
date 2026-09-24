@@ -685,6 +685,7 @@ using terms from application "Mail"
             my putValue(resultObject, "message_ref", referenceObject)
             my putValue(resultObject, "sender", sender of aMessage as text)
             my putValue(resultObject, "subject", subject of aMessage as text)
+            my putValue(resultObject, "read", read status of aMessage as boolean)
             try
                 my putValue(resultObject, "date_received", date received of aMessage as text)
             on error
@@ -883,6 +884,12 @@ using terms from application "Mail"
             if subjectFilter is not "" and senderFilter is not "" and sinceDate is not missing value then return every message of inboxMailbox whose subject contains subjectFilter and sender contains senderFilter and date received ≥ sinceDate
             if subjectFilter is not "" and senderFilter is not "" and unreadOnly then return every message of inboxMailbox whose subject contains subjectFilter and sender contains senderFilter and read status is false
             if subjectFilter is not "" and senderFilter is not "" then return every message of inboxMailbox whose subject contains subjectFilter and sender contains senderFilter
+            if subjectFilter is not "" and sinceDate is not missing value and unreadOnly then return every message of inboxMailbox whose subject contains subjectFilter and date received ≥ sinceDate and read status is false
+            if subjectFilter is not "" and sinceDate is not missing value then return every message of inboxMailbox whose subject contains subjectFilter and date received ≥ sinceDate
+            if subjectFilter is not "" and unreadOnly then return every message of inboxMailbox whose subject contains subjectFilter and read status is false
+            if senderFilter is not "" and sinceDate is not missing value and unreadOnly then return every message of inboxMailbox whose sender contains senderFilter and date received ≥ sinceDate and read status is false
+            if senderFilter is not "" and sinceDate is not missing value then return every message of inboxMailbox whose sender contains senderFilter and date received ≥ sinceDate
+            if senderFilter is not "" and unreadOnly then return every message of inboxMailbox whose sender contains senderFilter and read status is false
             if unreadOnly then return every message of inboxMailbox whose read status is false
             if sinceDate is not missing value then return every message of inboxMailbox whose date received ≥ sinceDate
             if subjectFilter is not "" then return every message of inboxMailbox whose subject contains subjectFilter
@@ -892,7 +899,7 @@ using terms from application "Mail"
     end inboxCandidates
 
 
-    on rankedInboxMatches(senderFilter, senderIdentity, subjectFilter, sinceEpoch, beforeEpoch, unreadOnly, resultLimit)
+    on rankedInboxMatches(senderFilter, senderIdentity, subjectFilter, sinceEpoch, beforeEpoch, unreadOnly, resultLimit, cursorEpoch, cursorAccountID, cursorLocalID)
         tell application "Mail"
             -- Mail's aggregate inbox is the same role-backed collection shown as
             -- All Inboxes in the UI. Its children retain their real account.
@@ -902,6 +909,8 @@ using terms from application "Mail"
             set beforeDate to missing value
             if sinceEpoch ≥ 0 then set sinceDate to (current application's NSDate's dateWithTimeIntervalSince1970:sinceEpoch) as date
             if beforeEpoch ≥ 0 then set beforeDate to (current application's NSDate's dateWithTimeIntervalSince1970:beforeEpoch) as date
+            set cursorItem to missing value
+            if cursorEpoch ≥ 0 then set cursorItem to {(current application's NSDate's dateWithTimeIntervalSince1970:cursorEpoch) as date, cursorAccountID, cursorLocalID}
             set rankedItems to {}
             set matchingCount to 0
             set scannedCount to 0
@@ -919,14 +928,8 @@ using terms from application "Mail"
                         set includeMessage to true
                         if sinceDate is not missing value and receivedDate < sinceDate then set includeMessage to false
                         if beforeDate is not missing value and receivedDate ≥ beforeDate then set includeMessage to false
-                        if includeMessage and senderFilter is not "" then
-                            if (my normalizedLower(sender of aMessage as text)) does not contain (my normalizedLower(senderFilter)) then set includeMessage to false
-                        end if
                         if includeMessage and senderIdentity is not "" then
                             if not my identityMatches(sender of aMessage as text, senderIdentity) then set includeMessage to false
-                        end if
-                        if includeMessage and subjectFilter is not "" then
-                            if (my normalizedLower(subject of aMessage as text)) does not contain (my normalizedLower(subjectFilter)) then set includeMessage to false
                         end if
                         if includeMessage and unreadOnly then
                             -- An unavailable read status cannot establish an unread match.
@@ -934,9 +937,13 @@ using terms from application "Mail"
                         end if
                         if includeMessage then
                             set localID to (get id of aMessage) as integer
-                            set matchingCount to matchingCount + 1
                             set candidateItem to {receivedDate, accountID, localID, anAccount, pathItems, aMessage}
-                            set rankedItems to my insertRecent(rankedItems, candidateItem, resultLimit)
+                            set afterCursor to true
+                            if cursorItem is not missing value then set afterCursor to my recentPrecedes(cursorItem, candidateItem)
+                            if afterCursor then
+                                set matchingCount to matchingCount + 1
+                                set rankedItems to my insertRecent(rankedItems, candidateItem, resultLimit)
+                            end if
                         end if
                     end repeat
                     set scannedCount to scannedCount + 1
@@ -951,6 +958,25 @@ using terms from application "Mail"
             return {rankedItems, matchingCount, scannedCount, count of inboxItems, failureArray}
         end tell
     end rankedInboxMatches
+
+
+    on rankedSummaries(rankedItems, failureArray)
+        set messageArray to my newArray()
+        repeat with rankedItem in rankedItems
+            try
+                set messageRecord to my messageSummary(item 6 of rankedItem, item 4 of rankedItem, item 5 of rankedItem)
+                my putValue(messageRecord, "date_received_iso", my isoDate(item 1 of rankedItem))
+                my addValue(messageArray, messageRecord)
+            on error errorMessage number errorNumber
+                set failureObject to my newDictionary()
+                my putValue(failureObject, "account", name of item 4 of rankedItem as text)
+                my putValue(failureObject, "code", "MAIL_APPLESCRIPT_" & errorNumber)
+                my putValue(failureObject, "error", errorMessage)
+                my addValue(failureArray, failureObject)
+            end try
+        end repeat
+        return messageArray
+    end rankedSummaries
 
 
     on rankedMessages(rankedItems, bodyMode, includeHeaders, includeSource, failureArray)
@@ -995,7 +1021,7 @@ using terms from application "Mail"
         if resultLimit < 1 or resultLimit > 200 then error "Recent limit must be between 1 and 200" number 9121
         set searchAge to -1
         if unreadOnly or senderFilter is not "" or subjectFilter is not "" or sinceEpoch ≥ 0 or beforeEpoch ≥ 0 then
-            set {topItems, matchingCount, scannedCount, accountCount, failureArray} to my rankedInboxMatches(senderFilter, "", subjectFilter, sinceEpoch, beforeEpoch, unreadOnly, resultLimit)
+            set {topItems, matchingCount, scannedCount, accountCount, failureArray} to my rankedInboxMatches(senderFilter, "", subjectFilter, sinceEpoch, beforeEpoch, unreadOnly, resultLimit, -1, "", 0)
         else
             repeat with ageValue in {604800, 2592000, 31536000, -1}
                 set searchAge to ageValue as integer
@@ -1004,11 +1030,15 @@ using terms from application "Mail"
                     set nowObject to current application's NSDate's |date|()
                     set searchEpoch to (nowObject's timeIntervalSince1970() as real) - searchAge
                 end if
-                set {topItems, matchingCount, scannedCount, accountCount, failureArray} to my rankedInboxMatches("", "", "", searchEpoch, -1, false, resultLimit)
+                set {topItems, matchingCount, scannedCount, accountCount, failureArray} to my rankedInboxMatches("", "", "", searchEpoch, -1, false, resultLimit, -1, "", 0)
                 if (count of topItems) ≥ resultLimit or (failureArray's |count|() as integer) > 0 then exit repeat
             end repeat
         end if
-        set messageArray to my rankedMessages(topItems, bodyMode, false, false, failureArray)
+        if bodyMode is "none" then
+            set messageArray to my rankedSummaries(topItems, failureArray)
+        else
+            set messageArray to my rankedMessages(topItems, bodyMode, false, false, failureArray)
+        end if
         set isComplete to (failureArray's |count|() as integer) is 0
         set resultObject to my newDictionary()
         my putValue(resultObject, "ok", isComplete)
@@ -1073,17 +1103,22 @@ using terms from application "Mail"
     on commandLocate(requestObject)
         set senderIdentity to my requestText(requestObject, "sender_identity", "")
         set subjectFilter to my requestText(requestObject, "subject", "")
+        set unreadOnly to my requestBoolean(requestObject, "unread", false)
         set sinceEpoch to my requestReal(requestObject, "since_epoch_seconds", -1)
         set beforeEpoch to my requestReal(requestObject, "before_epoch_seconds", -1)
         set resultLimit to my requestInteger(requestObject, "limit", 50)
+        set cursorEpoch to my requestReal(requestObject, "cursor_epoch_seconds", -1)
+        set cursorAccountID to my requestText(requestObject, "cursor_account_id", "")
+        set cursorLocalID to my requestInteger(requestObject, "cursor_local_id", 0)
         set readIfUnique to my requestBoolean(requestObject, "read_if_unique", false)
         if readIfUnique and resultLimit < 2 then set resultLimit to 2
         set bodyMode to my requestText(requestObject, "body_mode", "excerpt")
         set includeHeaders to my requestBoolean(requestObject, "include_headers", false)
         set includeSource to my requestBoolean(requestObject, "include_source", false)
-        if senderIdentity is "" then error "A sender identity is required for cross-account INBOX lookup" number 9120
-        set senderToken to my firstIdentityToken(senderIdentity)
-        set {rankedItems, matchingCount, scannedCount, accountCount, failureArray} to my rankedInboxMatches(senderToken, senderIdentity, subjectFilter, sinceEpoch, beforeEpoch, false, resultLimit)
+        if senderIdentity is "" and subjectFilter is "" then error "A sender or subject is required for cross-account INBOX lookup" number 9120
+        set senderToken to ""
+        if senderIdentity is not "" then set senderToken to my firstIdentityToken(senderIdentity)
+        set {rankedItems, matchingCount, scannedCount, accountCount, failureArray} to my rankedInboxMatches(senderToken, senderIdentity, subjectFilter, sinceEpoch, beforeEpoch, unreadOnly, resultLimit, cursorEpoch, cursorAccountID, cursorLocalID)
         set isComplete to (failureArray's |count|() as integer) is 0
         set resultObject to my newDictionary()
         my putValue(resultObject, "operation", "locate")
@@ -1109,24 +1144,11 @@ using terms from application "Mail"
                 my putValue(resultObject, "unique_read", false)
             end if
         else
-            set messageArray to my newArray()
-            repeat with rankedItem in rankedItems
-                try
-                    set messageRecord to my messageSummary(item 6 of rankedItem, item 4 of rankedItem, item 5 of rankedItem)
-                    my putValue(messageRecord, "date_received_iso", my isoDate(item 1 of rankedItem))
-                    my addValue(messageArray, messageRecord)
-                on error errorMessage number errorNumber
-                    set isComplete to false
-                    set failureObject to my newDictionary()
-                    my putValue(failureObject, "account", name of item 4 of rankedItem as text)
-                    my putValue(failureObject, "code", "MAIL_APPLESCRIPT_" & errorNumber)
-                    my putValue(failureObject, "error", errorMessage)
-                    my addValue(failureArray, failureObject)
-                end try
-            end repeat
+            set messageArray to my rankedSummaries(rankedItems, failureArray)
             my putValue(resultObject, "messages", messageArray)
             my putValue(resultObject, "unique_read", false)
         end if
+        set isComplete to (failureArray's |count|() as integer) is 0
         my putValue(resultObject, "ok", isComplete)
         my putValue(resultObject, "complete", isComplete)
         my putValue(resultObject, "failures", failureArray)
